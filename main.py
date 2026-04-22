@@ -21,6 +21,8 @@ from web.app import create_app
 from services.broadcast_queue import broadcast_queue, start_broadcast_workers, stop_broadcast_workers
 from services.notifications import notify_admins
 
+import os
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -114,7 +116,8 @@ def main():
     app = create_app()
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
-    web.run_app(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    web.run_app(app, host="0.0.0.0", port=port)
     app["bot"] = bot
 
 if __name__ == "__main__":
