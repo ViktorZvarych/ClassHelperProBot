@@ -1,0 +1,2720 @@
+# 📘 Технічне завдання: Telegram-бот «ClassHelperProBot»
+## Версія 9.0 — Ultimate Production-Ready (Фінальна редакція)
+
+> **Примітка щодо версії:** Цей документ є самодостатнім і повністю автономним. Усі розділи, включно з міграціями SQL та інструкцією Supabase, наведені в повному обсязі. Версія 9.0 усуває критичні технічні протиріччя, виявлені у версії 8.0.
+
+---
+
+### Зміст
+
+1. [Загальна архітектура та інфраструктура](#1-загальна-архітектура-та-інфраструктура)
+2. [Змінні оточення](#2-змінні-оточення)
+3. [Структура проєкту](#3-структура-проєкту)
+4. [Залежності](#4-залежності)
+5. [Безпека](#5-безпека)
+6. [База даних](#6-база-даних)
+7. [Ролі та права доступу](#7-ролі-та-права-доступу)
+8. [Реєстрація користувача](#8-реєстрація-користувача)
+9. [Головне меню користувача](#9-головне-меню-користувача)
+10. [Розклад](#10-розклад)
+11. [Домашнє завдання](#11-домашнє-завдання)
+12. [Масова розсилка](#12-масова-розсилка)
+13. [Чергування](#13-чергування)
+14. [Cron скидання навчального року](#14-cron-скидання-навчального-року)
+15. [Адміністративна панель](#15-адміністративна-панель)
+16. [FSM стани](#16-fsm-стани)
+17. [Middleware стек](#17-middleware-стек)
+18. [UX вимоги](#18-ux-вимоги)
+19. [Обробка помилок](#19-обробка-помилок)
+20. [Логування](#20-логування)
+21. [Graceful Shutdown](#21-graceful-shutdown)
+22. [Міграції та початкове наповнення БД](#22-міграції-та-початкове-наповнення-бд)
+23. [Інструкція для адміністратора Supabase](#23-інструкція-для-адміністратора-supabase)
+24. [Додаткові вимоги](#24-додаткові-вимоги)
+25. [Тестування](#25-тестування)
+26. [Definition of Done](#26-definition-of-done)
+
+---
+
+## 1. Загальна архітектура та інфраструктура
+
+### 1.1. Назва проєкту
+
+**ClassHelperProBot**
+
+### 1.2. Технології
+
+| Компонент | Технологія |
+|---|---|
+| Мова | Python 3.10+ |
+| Telegram-фреймворк | Aiogram 3.x |
+| HTTP-сервер | aiohttp (webhook-режим) |
+| База даних | PostgreSQL (asyncpg, connection pool) |
+| FSM storage | Redis (обов'язково) |
+| Кешування та rate limiting | Redis (спільний інстанс) |
+
+**asyncpg pool:** `asyncpg.create_pool(min_size=1, max_size=10)`.
+
+### 1.3. Хостинг та Keep-alive
+
+- **Платформа:** Render Web Service (сервіс «засинає» через 15 хвилин без активності на безкоштовному плані).
+- **Keep-alive:** cron-job.org пінгує `/ping` кожні 10 хвилин окремим завданням.
+
+**Важливо — два окремих cron-job.org завдання для keep-alive і cron:**
+
+Для кожного `/cron/*` ендпоінта в cron-job.org створюються **два окремих завдання**, що виконуються одне за одним:
+
+- **Завдання 1 (wake-up):** GET `/ping` — виконується за 2 хвилини до планового cron (наприклад, о 19:58 для вечірнього). Гарантує пробудження сервісу.
+- **Завдання 2 (actual cron):** GET `/cron/evening` або `/cron/morning` — виконується рівно о потрібному часі (20:00 або 09:45). До цього моменту сервіс вже прокинувся.
+
+Таким чином, не потрібно комбінувати логіку пробудження і корисного навантаження в одному запиті. Ідемпотентність (Redis Lock + `cron_runs`) захищає від випадкового подвійного виконання.
+
+### 1.4. HTTP-ендпоінти
+
+| Метод | Шлях | Призначення |
+|---|---|---|
+| POST | `/webhook` | Отримання update від Telegram (з валідацією secret token) |
+| GET | `/ping` | Keep-alive (повертає `200 OK {"status":"ok"}`, без звернень до БД) |
+| GET | `/cron/evening` | Вечірній звіт (20:00 за Kyiv) |
+| GET | `/cron/morning` | Ранковий звіт (09:45 за Kyiv) |
+| GET | `/cron/reset_academic_year` | Скидання даних 1 вересня (00:05 за Kyiv) |
+
+#### 1.4.1. Налаштування планувальника (cron-job.org)
+
+Усі завдання в cron-job.org налаштовуються на часовий пояс **Europe/Kyiv**. Це гарантує, що виклики відбуваються рівно о 20:00, 09:45 та 00:05 за київським часом, і запис `run_date` у таблицю `cron_runs` є коректним.
+
+Кожен запит до `/cron/*` повинен містити заголовок `X-Cron-Token` (значення — `CRON_SECRET_TOKEN`). Якщо заголовок відсутній або невірний — відповідь `HTTP 403`.
+
+### 1.5. Webhook: безпека та ініціалізація
+
+- **При старті сервісу** спочатку викликається `await bot.delete_webhook(drop_pending_updates=True)` для очищення стану, і лише потім — `await bot.set_webhook(url=RENDER_EXTERNAL_URL + "/webhook", secret_token=WEBHOOK_SECRET)`. Це усуває проблему «застарілих» updates, що могли накопичитися під час простою сервісу.
+- У хендлері `/webhook` перевіряється заголовок `X-Telegram-Bot-Api-Secret-Token`. Якщо не збігається — `HTTP 403`.
+- Додатково перевіряється структура JSON (наявність поля `update_id`). Якщо структура некоректна — `HTTP 400`.
+- Таймаут обробки запиту — 10 секунд (Telegram чекає саме стільки).
+- У разі будь-якої помилки в хендлері — повертається `200 OK` (щоб Telegram не повторював запит), але помилка логується з рівнем `ERROR`.
+- Кожен отриманий update логується з рівнем `DEBUG` (тільки `update_id`, без конфіденційного вмісту).
+
+### 1.6. Ідемпотентність обробки Update (захист від дублів)
+
+Кожен отриманий `update_id` зберігається в Redis з ключем `processed_update:{update_id}` та TTL 86400 секунд (24 години). Перед обробкою update бот перевіряє наявність цього ключа. Якщо ключ існує — обробка пропускається, повертається `200 OK` без виконання логіки. Якщо Redis недоступний — логується попередження, але обробка **не блокується** (ризик дубліката вважається прийнятним для забезпечення доступності).
+
+### 1.7. Захист від повторного натискання inline-кнопок
+
+Для запобігання подвійній обробці одного callback (швидкі повторні кліки) використовується Redis-ключ `callback_processed:{callback_id}` з TTL 60 секунд. Перед виконанням логіки обробник callback'у перевіряє наявність ключа. Якщо ключ існує — обробка ігнорується (виконується тільки `await callback.answer()`). Якщо Redis недоступний — перевірка пропускається з логуванням `WARNING`.
+
+### 1.8. Реєстрація команд бота в Telegram
+
+При старті (після встановлення webhook) бот реєструє список команд через `await bot.set_my_commands(...)`:
+
+```python
+from aiogram.types import BotCommand
+
+await bot.set_my_commands([
+    BotCommand(command="start", description="Запустити бота / головне меню"),
+    BotCommand(command="myid",  description="Дізнатися свій Telegram ID"),
+    BotCommand(command="admin", description="Адміністративна панель (тільки адміни)"),
+])
+```
+
+Ці команди відображаються в меню команд Telegram і доступні через `/`.
+
+### 1.9. Перевірка конфігурації та сервісів при старті
+
+Під час запуску бот виконує перевірку критичних змінних оточення та доступності залежних сервісів у такому порядку:
+
+1. **Змінні оточення:** перевірити, що всі обов'язкові змінні присутні та не порожні. Якщо будь-яка відсутня — логується `CRITICAL`, процес завершується з кодом 1.
+2. **PostgreSQL:** виконати `SELECT 1`. Якщо помилка — `CRITICAL`, завершення.
+3. **Redis:** виконати `PING`. Якщо помилка — `CRITICAL`, завершення.
+4. **Telegram чат:** викликати `bot.get_chat(chat_id=GROUP_CHAT_ID)`. Якщо чат недоступний або ID некоректний — `CRITICAL`, завершення.
+5. **Sentry (якщо вказано):** ініціалізувати Sentry SDK (п. 1.10).
+6. Якщо будь-яка з перевірок (кроки 2–4) не пройдена, і при цьому вже вдалося підключитися до Telegram, бот надсилає сповіщення всім `SUPER_ADMIN_IDS` і лише після цього завершує процес.
+
+### 1.10. Інтеграція Sentry (опціонально)
+
+Якщо в змінних оточення вказано `SENTRY_DSN` (непорожній рядок), при старті виконується ініціалізація:
+
+```python
+import sentry_sdk
+
+if settings.SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=settings.SENTRY_DSN,
+        traces_sample_rate=0.1,   # 10% транзакцій для performance monitoring
+        environment="production",
+    )
+```
+
+Усі непередбачені винятки автоматично надсилаються до Sentry через глобальний exception handler (п. 19.4). Якщо `SENTRY_DSN` не вказано — Sentry не підключається, додаткових дій не потрібно.
+
+**Залежність:** `sentry-sdk>=2.0.0` додається до `requirements.txt` безумовно, але ініціалізується тільки за наявності `SENTRY_DSN`.
+
+### 1.11. Timezone
+
+Уся логіка, що працює з датами (розрахунок тижня, визначення «сьогодні», збереження `run_date` в `cron_runs`, перевірка навчального дня тощо) використовує **Europe/Kyiv** (змінна `TIMEZONE`). При отриманні поточної дати обов'язково конвертувати UTC у Київ:
+
+```python
+from zoneinfo import ZoneInfo  # вбудовано в Python 3.9+, окремий пакет не потрібен
+from datetime import datetime, date
+
+def now_kyiv() -> datetime:
+    return datetime.now(tz=ZoneInfo(settings.TIMEZONE))
+
+def today_kyiv() -> date:
+    return now_kyiv().date()
+```
+
+---
+
+## 2. Змінні оточення
+
+Файл `.env` у кореневій директорії проєкту:
+
+```env
+# Telegram
+BOT_TOKEN=                        # Токен бота від @BotFather
+WEBHOOK_SECRET=                   # Довільний рядок для підпису webhook (мін. 32 символи)
+
+# База даних
+DATABASE_URL=postgresql://user:pass@host:5432/db
+
+# Redis
+REDIS_URL=redis://localhost:6379/0
+
+# Хостинг
+RENDER_EXTERNAL_URL=              # Наприклад: https://myclassbot.onrender.com
+
+# Безпека
+CRON_SECRET_TOKEN=                # Токен для захисту /cron/* ендпоінтів (мін. 32 символи)
+GROUP_CHAT_ID=                    # ID групового чату класу (від'ємне число)
+SUPER_ADMIN_IDS=123456789,987654321  # Telegram ID супер-адмінів через кому
+
+# Час
+TIMEZONE=Europe/Kyiv
+
+# Моніторинг (опціонально — якщо порожньо, Sentry не підключається)
+SENTRY_DSN=
+```
+
+**Правила:**
+- Файл `.env` додається до `.gitignore`.
+- Файл `.env.example` з порожніми значеннями знаходиться в репозиторії для документування.
+- На Render усі змінні встановлюються через Dashboard → Environment Variables.
+- При зміні будь-якої змінної сервіс перезапускається вручну.
+
+**Завантаження через `config.py` (pydantic-settings):**
+
+```python
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import list as List
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
+    BOT_TOKEN: str
+    WEBHOOK_SECRET: str
+    DATABASE_URL: str
+    REDIS_URL: str
+    RENDER_EXTERNAL_URL: str
+    CRON_SECRET_TOKEN: str
+    GROUP_CHAT_ID: int
+    SUPER_ADMIN_IDS: List[int]   # pydantic-settings парсить "123,456" як [123, 456]
+    TIMEZONE: str = "Europe/Kyiv"
+    SENTRY_DSN: str = ""
+
+    @property
+    def super_admin_ids_set(self) -> set[int]:
+        return set(self.SUPER_ADMIN_IDS)
+
+settings = Settings()
+```
+
+---
+
+## 3. Структура проєкту
+
+```
+classhelperprobot/
+├── .env                          # Змінні оточення (не в git)
+├── .env.example                  # Шаблон (у git)
+├── .gitignore
+├── requirements.txt
+├── requirements-dev.txt          # Залежності для тестів та розробки
+├── README.md
+├── SUPABASE_SETUP.md             # Інструкція для адміна Supabase
+│
+├── main.py                       # Точка входу: startup, реєстрація роутерів, запуск aiohttp
+├── config.py                     # Завантаження та валідація .env через pydantic-settings
+│
+├── bot/
+│   ├── __init__.py
+│   ├── instance.py               # Singleton: bot (Bot), dp (Dispatcher)
+│   │
+│   ├── handlers/
+│   │   ├── __init__.py
+│   │   ├── start.py              # /start, /myid
+│   │   ├── schedule.py           # Розклад
+│   │   ├── homework.py           # Домашнє завдання
+│   │   ├── duty.py               # Чергування (перегляд + підтвердження)
+│   │   ├── broadcast.py          # Масова розсилка
+│   │   ├── common.py             # Обробка невідомих команд/повідомлень
+│   │   └── admin/
+│   │       ├── __init__.py
+│   │       ├── panel.py          # /admin, головне меню адміна
+│   │       ├── absence.py        # Відмітка відсутніх
+│   │       ├── homework.py       # Редагування ДЗ
+│   │       ├── students.py       # Керування класом
+│   │       ├── holidays.py       # Канікули
+│   │       └── class_info.py     # Назва класу
+│   │
+│   ├── keyboards/
+│   │   ├── __init__.py
+│   │   ├── main_menu.py          # Reply-клавіатура головного меню
+│   │   └── inline/
+│   │       ├── homework.py
+│   │       ├── duty.py
+│   │       ├── admin.py
+│   │       └── common.py         # Кнопки підтвердження / скасування
+│   │
+│   ├── states/
+│   │   ├── __init__.py
+│   │   └── fsm.py                # Усі FSM StatesGroup
+│   │
+│   └── middlewares/
+│       ├── __init__.py
+│       ├── auth.py               # Перевірка ролі та реєстрації
+│       ├── fsm_timeout.py        # Перевірка TTL стану FSM
+│       ├── throttling.py         # Rate limiting
+│       └── idempotency.py        # Ідемпотентність update та callback
+│
+├── db/
+│   ├── __init__.py
+│   ├── pool.py                   # create_pool, get_pool
+│   └── queries/
+│       ├── __init__.py
+│       ├── students.py
+│       ├── absence.py
+│       ├── duty.py
+│       ├── homework.py
+│       ├── schedule.py
+│       ├── cron.py
+│       └── admin.py
+│
+├── services/
+│   ├── __init__.py
+│   ├── schedule.py               # Логіка розкладу та типу тижня
+│   ├── duty_algorithm.py         # Алгоритм розрахунку чергових
+│   ├── broadcast_queue.py        # asyncio.Queue + воркери
+│   └── notifications.py          # Надсилання повідомлень адмінам
+│
+├── cron/
+│   ├── __init__.py
+│   ├── base.py                   # Redis Lock + cron_runs idempotency
+│   ├── evening.py                # Вечірній cron
+│   ├── morning.py                # Ранковий cron
+│   └── reset_year.py             # Скидання навчального року
+│
+├── web/
+│   ├── __init__.py
+│   ├── app.py                    # aiohttp Application, startup/cleanup, маршрути
+│   └── routes.py                 # Хендлери ендпоінтів (webhook, ping, cron/*)
+│
+├── migrations/
+│   └── 001_init_db.sql           # Ідемпотентний скрипт ініціалізації БД
+│
+└── tests/
+    ├── __init__.py
+    ├── conftest.py               # Фікстури pytest (mock db, redis, bot)
+    ├── test_week_type.py
+    ├── test_duty_algorithm.py
+    ├── test_is_school_day.py
+    └── test_cron_idempotency.py
+```
+
+---
+
+## 4. Залежності
+
+Файл `requirements.txt`:
+
+```
+aiogram==3.7.0
+aiohttp==3.9.5
+asyncpg==0.29.0
+redis[hiredis]==5.0.4
+pydantic-settings==2.2.1
+python-dotenv==1.0.1
+sentry-sdk>=2.0.0
+```
+
+Файл `requirements-dev.txt` (тільки для розробки та CI):
+
+```
+pytest==8.2.0
+pytest-asyncio==0.23.7
+pytest-mock==3.14.0
+```
+
+**Примітки:**
+- `aiogram` 3.x використовує `aiohttp` як транспорт — обидва вказані явно для ясності.
+- `redis[hiredis]` — hiredis прискорює парсинг відповідей Redis у кілька разів.
+- `pydantic-settings` — завантаження та валідація `.env`.
+- `sentry-sdk` — встановлюється завжди, ініціалізується лише за наявності `SENTRY_DSN`.
+- `zoneinfo` — **вбудований модуль Python 3.9+**, окремий пакет не потрібен. Вимога Python 3.10+ гарантує його доступність.
+
+---
+
+## 5. Безпека
+
+### 5.1. Ролі та доступ до адмін-панелі
+
+До адміністративних функцій (панель `/admin`) допускаються тільки користувачі, чий `telegram_id` входить до `SUPER_ADMIN_IDS`. Перевіряється **до** виклику будь-якого admin-хендлера через middleware (п. 17).
+
+### 5.2. Захист cron-ендпоінтів
+
+Кожен запит до `/cron/*` повинен містити заголовок `X-Cron-Token` зі значенням, що дорівнює `CRON_SECRET_TOKEN`. Якщо заголовок відсутній або невірний — `HTTP 403`.
+
+### 5.3. Захист від повторного виконання cron (Race Condition)
+
+Використовується **двошарова** ідемпотентність:
+
+**Шар 1 — Redis Lock:**
+- Ключ: `cron_lock:{endpoint}:{run_date}` (де `run_date` — дата за Kyiv у форматі `YYYY-MM-DD`).
+- Алгоритм `SET NX EX 30` (TTL 30 секунд, достатньо для виконання однієї cron-задачі).
+- Якщо лок не отримано — повертаємо `HTTP 200 {"status":"skipped","reason":"lock"}`.
+
+**Шар 2 — БД idempotency:**
+- `INSERT INTO cron_runs (endpoint, run_date) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id`.
+- Якщо `RETURNING` порожнє — запис уже існує, звільняємо Redis-лок і виходимо.
+
+**Повний алгоритм захисту:**
+
+1. Перевірити `X-Cron-Token`. Якщо невірний — `HTTP 403`.
+2. Спроба отримати Redis Lock (SET NX EX 30).
+3. Якщо невдало — вихід (`HTTP 200 {"status":"skipped","reason":"lock"}`).
+4. Спроба `INSERT INTO cron_runs (endpoint, run_date) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id`.
+5. Якщо `RETURNING` порожнє — звільнити Redis-лок (`DEL cron_lock:...`) і вийти (`HTTP 200 {"status":"skipped","reason":"already_run"}`).
+6. Виконати корисну роботу.
+7. Явно звільнити Redis-лок після завершення (`DEL cron_lock:...`). У разі краша лок розблокується через TTL (30 с).
+
+### 5.4. Захист від спаму при `/start` для невідомих користувачів
+
+Коли незнайомий користувач викликає `/start`, бот надсилає повідомлення кожному `SUPER_ADMIN` в особисті. Щоб уникнути спаму:
+
+- Redis-ключ: `start_notify:{user_id}`, TTL 600 секунд (10 хвилин).
+- Якщо ключ існує — сповіщення не надсилається.
+- Якщо ключ відсутній — надсилається та ключ встановлюється.
+
+---
+
+## 6. База даних
+
+Повна схема з усіма таблицями, індексами, тригерами та обмеженнями. Єдиним джерелом істини для схеми є файл `migrations/001_init_db.sql` (п. 22).
+
+### 6.1. `students`
+
+```sql
+CREATE TABLE students (
+    id                    SERIAL PRIMARY KEY,
+    full_name             TEXT NOT NULL,
+    telegram_id           BIGINT NULL UNIQUE,
+    role                  TEXT NOT NULL DEFAULT 'student'
+                              CHECK (role IN ('student','starosta','zamstarosta','redactor')),
+    group_name            TEXT NOT NULL DEFAULT 'all'
+                              CHECK (group_name IN ('A', 'B', 'all')),
+    is_active             BOOLEAN NOT NULL DEFAULT true,
+    absent_date           DATE NULL,
+        -- Кеш стану «відсутній сьогодні» для швидкого читання.
+        -- Оновлюється ВИКЛЮЧНО тригером trg_sync_absent_cache (п.6.14)
+        -- на основі absence_log. Заборонено оновлювати це поле вручну
+        -- в бізнес-логіці — використовувати лише absence_log.
+    last_duty_date        DATE NULL,
+    consecutive_duty_skip INT NOT NULL DEFAULT 0,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_students_telegram_id ON students(telegram_id);
+CREATE INDEX idx_students_is_active ON students(is_active);
+
+-- Гарантує: не більше одного активного старости в будь-який момент.
+-- Неактивні (is_active = false) цим індексом не обмежуються.
+CREATE UNIQUE INDEX one_starosta
+    ON students(role)
+    WHERE role = 'starosta' AND is_active = true;
+```
+
+### 6.2. `absence_log` (єдине джерело істини про відсутність)
+
+```sql
+CREATE TABLE absence_log (
+    id           SERIAL PRIMARY KEY,
+    student_id   INT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    absent_date  DATE NOT NULL,
+    is_cancelled BOOLEAN NOT NULL DEFAULT false,
+        -- Дозволяє скасувати помилкову відмітку без фізичного видалення.
+        -- Запис з is_cancelled = true не враховується в жодній бізнес-логіці.
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),  -- оновлюється при is_cancelled -> true
+    UNIQUE(student_id, absent_date)
+);
+
+-- Частковий індекс: лише активні (не скасовані) відмітки відсутності
+CREATE INDEX idx_absence_active
+    ON absence_log(student_id, absent_date)
+    WHERE is_cancelled = false;
+
+CREATE INDEX idx_absence_log_absent_date
+    ON absence_log(absent_date)
+    WHERE is_cancelled = false;
+
+CREATE INDEX idx_absence_log_student_id ON absence_log(student_id);
+```
+
+### 6.3. `subjects`
+
+```sql
+CREATE TABLE subjects (
+    id   SERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+);
+```
+
+### 6.4. `timetable`
+
+```sql
+CREATE TABLE timetable (
+    id          SERIAL PRIMARY KEY,
+    day_of_week INT NOT NULL CHECK (day_of_week BETWEEN 0 AND 6),
+                             -- 0 = понеділок, 6 = неділя
+    lesson_num  INT NOT NULL CHECK (lesson_num BETWEEN 1 AND 12),
+                             -- Порядковий номер уроку (1, 2, 3...)
+    subject_id  INT REFERENCES subjects(id) ON DELETE SET NULL,
+    cabinet     TEXT,
+    teacher     TEXT,
+    week_type   TEXT NOT NULL
+                    CHECK (week_type IN ('numerator', 'denominator', 'both')),
+    group_name  TEXT NOT NULL
+                    CHECK (group_name IN ('A', 'B', 'all')),
+    UNIQUE(day_of_week, lesson_num, week_type, group_name)
+);
+
+CREATE INDEX idx_timetable_day_week_group
+    ON timetable(day_of_week, week_type, group_name);
+```
+
+### 6.5. `homework`
+
+```sql
+CREATE TABLE homework (
+    id          SERIAL PRIMARY KEY,
+    subject_id  INT REFERENCES subjects(id) ON DELETE SET NULL,
+    due_date    DATE NOT NULL,
+    description TEXT NOT NULL CHECK (length(description) BETWEEN 1 AND 500),
+    is_control  BOOLEAN NOT NULL DEFAULT false,
+    is_active   BOOLEAN NOT NULL DEFAULT true,  -- false = soft delete
+    added_by    BIGINT NOT NULL,                -- telegram_id того, хто додав
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_homework_due_date ON homework(due_date) WHERE is_active = true;
+CREATE INDEX idx_homework_subject_due ON homework(subject_id, due_date) WHERE is_active = true;
+```
+
+### 6.6. `duty_log`
+
+```sql
+CREATE TABLE duty_log (
+    id              SERIAL PRIMARY KEY,
+    duty_date       DATE NOT NULL,
+    student_id      INT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    status          TEXT NOT NULL
+                        CHECK (status IN ('pending', 'completed', 'replaced', 'absent')),
+    replaced_by_id  INT NULL REFERENCES students(id) ON DELETE SET NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(duty_date, student_id),
+    -- Якщо replaced: replaced_by_id обов'язковий і не може збігатися з student_id
+    CONSTRAINT duty_log_replaced_check CHECK (
+        (status = 'replaced' AND replaced_by_id IS NOT NULL AND replaced_by_id != student_id)
+        OR
+        (status != 'replaced' AND replaced_by_id IS NULL)
+    ),
+    -- completed не може мати replaced_by_id (замінений — окремий запис)
+    CONSTRAINT duty_log_completed_check CHECK (
+        status != 'completed' OR replaced_by_id IS NULL
+    )
+);
+
+CREATE INDEX idx_duty_log_duty_date ON duty_log(duty_date);
+CREATE INDEX idx_duty_log_student_id ON duty_log(student_id);
+CREATE INDEX idx_duty_log_replaced_by_id
+    ON duty_log(replaced_by_id)
+    WHERE replaced_by_id IS NOT NULL;
+```
+
+**Семантика статусів:**
+- `pending` — призначений черговий, чергування ще не підтверджено.
+- `completed` — чергування підтверджено, відбулося.
+- `replaced` — цей учень був відсутній і пропустив чергування; замість нього чергував інший (`replaced_by_id` = ID замінюючого).
+- `absent` — учень був відсутній, пропустив чергування, але жодного замінюючого не записано для нього (або заміна записана окремим `pending`-рядком).
+
+### 6.7. `holidays`
+
+```sql
+CREATE TABLE holidays (
+    id          SERIAL PRIMARY KEY,
+    start_date  DATE NOT NULL,
+    end_date    DATE NOT NULL,
+    description TEXT,
+    CHECK (end_date >= start_date)
+);
+
+CREATE INDEX idx_holidays_dates ON holidays(start_date, end_date);
+```
+
+### 6.8. `bot_messages`
+
+```sql
+CREATE TABLE bot_messages (
+    id              SERIAL PRIMARY KEY,
+    chat_id         BIGINT NOT NULL,
+    message_id      INT NOT NULL,
+    type            TEXT NOT NULL,      -- 'evening_duty'
+    duty_date       DATE NOT NULL,
+    evening_payload JSONB NOT NULL,
+        -- Формат: {"duty_students": [<student_id>, <student_id>, ...]}
+        -- Зберігає список student_id тих, хто був призначений вечірнім cron.
+        -- Використовується ранковим cron для порівняння.
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(chat_id, type, duty_date)
+);
+```
+
+### 6.9. `week_config` (завжди один запис з `id = 1`)
+
+```sql
+CREATE TABLE week_config (
+    id              INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    semester_start  DATE NOT NULL,
+    first_week_type TEXT NOT NULL
+                        CHECK (first_week_type IN ('numerator', 'denominator')),
+    is_active       BOOLEAN NOT NULL DEFAULT true
+);
+-- Запис завжди один: id=1.
+-- Для оновлення: INSERT ... ON CONFLICT (id) DO UPDATE.
+```
+
+### 6.10. `cron_runs`
+
+```sql
+CREATE TABLE cron_runs (
+    id        SERIAL PRIMARY KEY,
+    endpoint  TEXT NOT NULL,
+    run_date  DATE NOT NULL,
+    ran_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(endpoint, run_date)
+);
+```
+
+### 6.11. `class_info` (завжди один запис з `id = 1`)
+
+```sql
+CREATE TABLE class_info (
+    id                  INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    class_number        INT NOT NULL CHECK (class_number BETWEEN 1 AND 11),
+    class_letter        TEXT NOT NULL CHECK (length(class_letter) BETWEEN 1 AND 2),
+    academic_year_start DATE NOT NULL,
+    is_current          BOOLEAN NOT NULL DEFAULT true
+);
+-- Запис завжди один: id=1.
+```
+
+### 6.12. `duty_log_archive`
+
+```sql
+-- Архівна таблиця НЕ успадковує FK-обмеження з duty_log,
+-- щоб уникнути помилок при вставці після видалення students.
+-- Використовується тільки для зберігання та аудиту.
+CREATE TABLE duty_log_archive (
+    id              INT NOT NULL,
+    duty_date       DATE NOT NULL,
+    student_id      INT NOT NULL,       -- без FK (архів)
+    status          TEXT NOT NULL,
+    replaced_by_id  INT NULL,           -- без FK (архів)
+    created_at      TIMESTAMPTZ NOT NULL,
+    updated_at      TIMESTAMPTZ NOT NULL,
+    archived_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_duty_log_archive_duty_date ON duty_log_archive(duty_date);
+CREATE INDEX idx_duty_log_archive_student_id ON duty_log_archive(student_id);
+```
+
+> **Примітка:** Архівна таблиця навмисно не використовує `LIKE duty_log INCLUDING ALL`, оскільки `INCLUDING ALL` копіює і FK-обмеження (REFERENCES), що призводить до помилок під час архівування записів, пов'язаних з видаленими учнями. Колонки перераховані явно.
+
+### 6.13. `failed_jobs` (dead-letter лог)
+
+```sql
+CREATE TABLE failed_jobs (
+    id          SERIAL PRIMARY KEY,
+    job_type    TEXT NOT NULL,    -- 'broadcast', 'cron', 'callback', 'webhook', 'exception'
+    payload     JSONB,            -- вхідні дані операції (без персональних даних)
+    error       TEXT NOT NULL,    -- повідомлення про помилку
+    attempts    INT NOT NULL DEFAULT 1,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+Записи в цій таблиці — основа для ручного аналізу та повторного виконання невдалих операцій.
+
+### 6.14. Тригер для синхронізації кешу `students.absent_date`
+
+```sql
+-- Ця функція є ЄДИНИМ місцем, де оновлюється students.absent_date.
+-- Бізнес-логіка (handlers, admin) ніколи не оновлює absent_date напряму —
+-- тільки через відповідний запис в absence_log.
+CREATE OR REPLACE FUNCTION sync_absent_cache()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    -- При видаленні запису з absence_log — скинути кеш
+    UPDATE students
+    SET absent_date = NULL, updated_at = now()
+    WHERE id = OLD.student_id
+      AND absent_date = OLD.absent_date;
+    RETURN OLD;
+  END IF;
+
+  -- INSERT або UPDATE
+  IF NEW.is_cancelled = false THEN
+    -- Активна відмітка → встановити кеш
+    UPDATE students
+    SET absent_date = NEW.absent_date, updated_at = now()
+    WHERE id = NEW.student_id;
+  ELSE
+    -- Скасована відмітка (is_cancelled = true) → скинути кеш
+    -- але тільки якщо absent_date в кеші збігається з цим записом
+    UPDATE students
+    SET absent_date = NULL, updated_at = now()
+    WHERE id = NEW.student_id
+      AND absent_date = NEW.absent_date;
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_sync_absent_cache ON absence_log;
+CREATE TRIGGER trg_sync_absent_cache
+AFTER INSERT OR UPDATE OR DELETE ON absence_log
+FOR EACH ROW EXECUTE FUNCTION sync_absent_cache();
+```
+
+> **Архітектурна примітка щодо `updated_at` і відмітки відсутніх:**
+>
+> Тригер автоматично оновлює `students.updated_at` при кожній зміні в `absence_log`. Це є задокументованою поведінкою, яку використовує оптимістичне блокування в панелі відмітки відсутніх (п. 15.3).
+>
+> **Правило:** бізнес-логіка ніколи не оновлює `students.absent_date` або `students.updated_at` вручну. Зміна стану відсутності здійснюється **виключно** через `INSERT/UPDATE` в `absence_log`, після чого тригер автоматично актуалізує кеш у `students`. Оптимістичне блокування в п. 15.3 ґрунтується на тому, що `students.updated_at` відображає момент останньої зміни через `absence_log`, і будь-яке зовнішнє втручання (з іншої сесії) буде видно через зміну цього поля.
+
+---
+
+## 7. Ролі та права доступу
+
+| Дія | `student` | `zamstarosta` | `redactor` | `starosta` | `super_admin` |
+|---|:---:|:---:|:---:|:---:|:---:|
+| Перегляд розкладу | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Перегляд ДЗ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Перегляд чергових | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Підтвердити **своє** чергування | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Підтвердити чергування **будь-кого** | ❌ | ✅ | ❌ | ✅ | ✅ |
+| Масова розсилка | ❌ | ❌ | ✅ | ✅ | ✅ |
+| Відмітити відсутніх | ❌ | ✅ | ❌ | ✅ | ✅ |
+| Адміністративна панель (`/admin`) | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Редагувати ДЗ | ❌ | ❌ | ✅ | ✅ | ✅ |
+
+**Примітки:**
+- `super_admin` — користувачі з `telegram_id` у `SUPER_ADMIN_IDS` (змінна оточення). Перевіряється незалежно від ролі в БД; пріоритет `super_admin` вищий за будь-яку роль БД.
+- `starosta` та `zamstarosta` — ролі в таблиці `students`. Перевіряються за `telegram_id`.
+- `zamstarosta` має право відмічати відсутніх, оскільки в разі відсутності старости необхідно мати заміну для цієї функції.
+- Незареєстрований користувач (не знайдений у `students`) не має доступу ні до якої функції, крім `/myid`.
+
+---
+
+## 8. Реєстрація користувача
+
+### 8.1. Команда `/start`
+
+**Алгоритм:**
+
+1. Отримати `telegram_id` з `message.from_user.id`.
+2. Запит:
+   ```sql
+   SELECT id, full_name, role
+   FROM students
+   WHERE telegram_id = $1 AND is_active = true;
+   ```
+3. **Якщо знайдено:** показати головне меню (п. 9) з привітанням:
+   ```
+   👋 Вітаємо, {full_name}!
+   Оберіть дію з меню нижче.
+   ```
+4. **Якщо не знайдено:** надіслати користувачеві:
+   ```
+   ❌ Вас ще немає в списку класу.
+   Зверніться до старости або адміністратора, щоб вас додали.
+   
+   Ваш Telegram ID: {telegram_id}
+   (скопіюйте та передайте адміністратору)
+   ```
+   Надіслати кожному `SUPER_ADMIN` в особисті (з throttle — не частіше ніж 1 раз на 10 хвилин на цього `user_id`):
+   ```
+   🔔 Новий користувач намагався запустити бота:
+   Ім'я: {first_name} {last_name}
+   Username: @{username} (або «немає»)
+   Telegram ID: {telegram_id}
+   
+   Якщо це учень класу — додайте його через адмін-панель:
+   /admin → Керування класом → Змінити дані учня → Встановити Telegram ID
+   ```
+5. **Важливо:** команда `/start` завжди повністю скидає поточний FSM-стан користувача (`await state.clear()`).
+
+### 8.2. Команда `/myid`
+
+Доступна всім (незалежно від реєстрації). Повертає:
+
+```
+🆔 Ваш Telegram ID: 123456789
+Скопіюйте його та передайте адміністратору для реєстрації в системі.
+```
+
+### 8.3. Прив'язка telegram_id до наявного учня
+
+Адмін може додати або змінити `telegram_id` для існуючого запису в `students` через: Адмін-панель → «Керування класом» → «Змінити дані учня» → «Встановити Telegram ID». Після прив'язки учень може увійти через `/start`.
+
+При встановленні нового `telegram_id` система перевіряє відсутність конфлікту з іншим учнем:
+
+```sql
+SELECT id FROM students WHERE telegram_id = $new_id AND id != $student_id;
+```
+
+Якщо такий запис існує — повідомлення про помилку: *«❌ Цей Telegram ID вже прив'язано до іншого учня.»*
+
+---
+
+## 9. Головне меню користувача
+
+### 9.1. Reply-клавіатура (постійна, не inline)
+
+Відображається для всіх зареєстрованих користувачів:
+
+```
+[ 📅 Розклад сьогодні ] [ 📆 Розклад завтра  ]
+[ 📚 Домашнє завдання ] [ 🧹 Чергування      ]
+[ 👥 Список учнів     ] [ 📋 Відсутні за 5 днів ]
+```
+
+Для `super_admin` додатково відображається кнопка:
+
+```
+[ ⚙️ Адмін-панель ]
+```
+
+Клавіатура відправляється з параметром `resize_keyboard=True` (мінімальний розмір) та `persistent=True` (не зникає).
+
+### 9.2. Кнопка «👥 Список учнів»
+
+Виводить список учнів активного класу (`is_active = true`), відсортованих за `full_name ASC`, у форматі:
+
+```
+👥 Список учнів (7-А):
+
+1. Коваленко А. (🎓 Староста) — борг: НІ ✅
+2. Кравчук О. — борг: НІ ✅
+3. Мельник О. — борг: ТАК ❗
+4. Петренко П. (📎 Заст. старости) — борг: НІ ✅
+5. Шевченко Т. (✏️ Редактор) — борг: НІ ✅
+…
+```
+
+- **Ролі в дужках:** `(🎓 Староста)`, `(📎 Заст. старости)`, `(✏️ Редактор)`. Для `student` — роль не вказується.
+- **Борг:** `ТАК ❗` якщо `consecutive_duty_skip > 0`; `НІ ✅` якщо `= 0`.
+- Загальна кількість: `Всього учнів: {N}`.
+- Для користувачів, яким дозволена розсилка (`super_admin`, `starosta`, `redactor`), під списком — inline-кнопка `[ ✉️ Надіслати повідомлення класу ]`.
+
+### 9.3. Кнопка «📋 Відсутні за 5 днів»
+
+Показує дані з `absence_log` (`is_cancelled = false`) за останні 5 календарних днів включно з сьогодні. Порядок — від найближчого до найдавнішого. Формат:
+
+```
+📊 Відсутні за останні 5 днів (21.04 – 25.04):
+
+🔹 Пт, 25.04: Мельник О.
+🔹 Чт, 24.04: немає
+🔹 Ср, 23.04: Коваленко А.
+🔹 Вт, 22.04: немає
+🔹 Пн, 21.04: Іваненко І., Петренко П.
+```
+
+Якщо даних немає за всі 5 днів: `📭 За останні 5 днів відсутніх не зафіксовано.`
+
+---
+
+## 10. Розклад
+
+### 10.1. Визначення типу тижня для заданої дати
+
+```python
+from zoneinfo import ZoneInfo
+from datetime import date
+
+def get_week_type(target_date: date, semester_start: date, first_week_type: str) -> str:
+    """
+    Повертає 'numerator' або 'denominator' для заданої дати.
+
+    Args:
+        target_date: дата, для якої визначаємо тип тижня.
+        semester_start: перший день першого тижня семестру (з week_config).
+        first_week_type: тип першого тижня ('numerator' або 'denominator').
+
+    Returns:
+        'numerator' або 'denominator'.
+
+    Note:
+        Тиждень відраховується від semester_start.
+        Якщо target_date < semester_start — все одно розраховуємо
+        (від'ємні тижні коректно обробляються цілочисельним діленням Python).
+    """
+    days_since_start = (target_date - semester_start).days
+    weeks_since_start = days_since_start // 7
+    if weeks_since_start % 2 == 0:
+        return first_week_type
+    else:
+        return 'denominator' if first_week_type == 'numerator' else 'numerator'
+```
+
+Конфігурацію `week_config` брати з рядка `id = 1`. Якщо рядок відсутній — надіслати повідомлення адмінам і відповісти користувачеві:
+
+```
+⚙️ Конфігурацію розкладу не налаштовано.
+Зверніться до адміністратора.
+```
+
+### 10.2. Перевірка навчального дня
+
+```python
+from datetime import date
+import asyncpg
+
+async def is_school_day(target_date: date, pool: asyncpg.Pool) -> tuple[bool, str]:
+    """
+    Перевіряє, чи є задана дата навчальним днем.
+
+    Returns:
+        (True, '') — навчальний день.
+        (False, 'weekend') — вихідний (субота або неділя).
+        (False, 'holiday') — канікули (є запис в holidays).
+    """
+    # Крок 1: перевірка вихідного дня
+    if target_date.weekday() >= 5:   # 5 = субота, 6 = неділя
+        return False, 'weekend'
+
+    # Крок 2: перевірка канікул
+    row = await pool.fetchrow(
+        """
+        SELECT 1 FROM holidays
+        WHERE $1 BETWEEN start_date AND end_date
+        LIMIT 1
+        """,
+        target_date
+    )
+    if row:
+        return False, 'holiday'
+
+    return True, ''
+```
+
+### 10.3. Отримання розкладу на дату
+
+1. Визначити `week_type` для цієї дати (п. 10.1).
+2. Визначити `day_of_week` (0–6, де 0 = понеділок): `target_date.weekday()`.
+3. Визначити `group_name` поточного учня з `students.group_name`.
+4. Запит:
+   ```sql
+   SELECT
+       t.lesson_num,
+       s.name AS subject_name,
+       t.cabinet,
+       t.teacher,
+       t.week_type
+   FROM timetable t
+   JOIN subjects s ON s.id = t.subject_id
+   WHERE t.day_of_week = $1
+     AND (t.week_type = $2 OR t.week_type = 'both')
+     AND (
+           t.group_name = 'all'
+           OR ($3 != 'all' AND t.group_name = $3)
+         )
+   ORDER BY t.lesson_num;
+   ```
+   Де `$1` = `day_of_week`, `$2` = `week_type`, `$3` = `students.group_name` поточного учня.
+
+   **Пояснення умови фільтрації підгрупи:**
+   - `t.group_name = 'all'` — урок для всього класу, завжди показується.
+   - `($3 != 'all' AND t.group_name = $3)` — якщо учень належить до підгрупи A або B, показуються уроки його підгрупи.
+   - Якщо `$3 = 'all'` (учень не належить до підгрупи) — показуються тільки `t.group_name = 'all'`, уроки підгруп не відображаються.
+
+### 10.4. Кешування розкладу
+
+- **Ключ:** `timetable:{date_iso}:{group_name}:{week_type}` (наприклад, `timetable:2025-04-23:A:numerator`).
+- **TTL:** 300 секунд (5 хвилин).
+- **Серіалізація:** JSON-список об'єктів уроку.
+- **Запис у кеш:** після успішного отримання даних з БД.
+- **Читання з кешу:** перевіряти перед зверненням до БД.
+
+**Інвалідація кешу при зміні розкладу:**
+
+При будь-якій зміні в таблиці `timetable` (через адмінку) виконується неблокуюча курсорна інвалідація:
+
+```python
+async def invalidate_timetable_cache(redis: Redis) -> None:
+    """
+    Видаляє всі ключі кешу розкладу, використовуючи SCAN з курсором
+    (неблокуюча операція, безпечна для production Redis).
+    """
+    pattern = "timetable:*"
+    cursor = 0
+    keys_to_delete = []
+
+    while True:
+        cursor, keys = await redis.scan(cursor=cursor, match=pattern, count=100)
+        keys_to_delete.extend(keys)
+        if cursor == 0:
+            break
+
+    if keys_to_delete:
+        # Видаляємо батчами по 100 ключів (pipeline для ефективності)
+        pipe = redis.pipeline()
+        for key in keys_to_delete:
+            pipe.delete(key)
+        await pipe.execute()
+```
+
+### 10.5. Формат повідомлення розкладу
+
+```
+📆 Четвер, 23 квітня (Чисельник)
+
+1️⃣ Геометрія — каб. 310
+2️⃣ Хімія — каб. 402 🚨 Контрольна робота
+3️⃣ Фізкультура
+4️⃣ Історія — каб. 205
+
+🧹 Чергові на сьогодні:
+• Коваленко А.
+• Мельник О.
+• Кравчук О. (замість відсутнього Петренка С.)
+```
+
+- Якщо кабінет не вказано — не виводити «— каб. …».
+- Якщо уроків немає: замість списку — `📭 Розклад на цей день відсутній`.
+- Якщо день ненавчальний:
+  ```
+  😴 {Сьогодні/Завтра} — ненавчальний день ({вихідний/канікули}).
+  Відпочивайте! 🎉
+  ```
+- Секцію «🧹 Чергові» показувати тільки для навчального дня, де є записи в `duty_log` або `bot_messages`.
+
+---
+
+## 11. Домашнє завдання
+
+### 11.1. Підменю (inline-клавіатура)
+
+```
+[ 📖 На завтра ] [ 📅 На після-завтра ] [ 🗓 На дату ]
+```
+
+При виборі «🗓 На дату» — бот просить ввести дату:
+
+```
+📅 Введіть дату у форматі ДД.ММ.РРРР:
+```
+
+Валідація: перевіряти формат і відповідність реальній даті (наприклад, 31.02 не існує). При помилці:
+
+```
+❌ Невірний формат або неіснуюча дата.
+Спробуйте ще раз: ДД.ММ.РРРР
+```
+
+### 11.2. Логіка отримання ДЗ
+
+1. Перевірити, чи є `target_date` навчальним днем (`is_school_day`). Якщо ні:
+   ```
+   📭 На цей день немає уроків (вихідний або канікули).
+   ```
+2. Отримати розклад на `target_date` (п. 10.3).
+3. Для кожного предмета знайти ДЗ:
+   ```sql
+   SELECT description, is_control
+   FROM homework
+   WHERE subject_id = $1
+     AND due_date = $2
+     AND is_active = true
+   ORDER BY created_at DESC
+   LIMIT 1;
+   ```
+
+### 11.3. Формат повідомлення ДЗ
+
+```
+📚 Домашнє завдання на Четвер, 23 квітня:
+
+1️⃣ Геометрія
+   № 456, 458
+
+2️⃣ Хімія
+   🚨 Контрольна робота — повторити §12–15
+
+3️⃣ Фізкультура
+   ✅ Нічого не задано
+
+4️⃣ Історія
+   ✅ Нічого не задано
+```
+
+Якщо немає жодного предмета в розкладі: `📭 Розклад на цей день порожній, ДЗ відсутнє.`
+
+---
+
+## 12. Масова розсилка
+
+### 12.1. Доступ
+
+Кнопка «✉️ Надіслати повідомлення класу» відображається для: `super_admin`, `starosta`, `redactor`.
+
+### 12.2. Flow (FSM: `Broadcast`)
+
+1. Бот: *«Введіть текст повідомлення для розсилки (до 4000 символів):»*
+2. Користувач вводить текст. Якщо текст перевищує 4000 символів — помилка: *«❌ Текст занадто довгий. Скоротіть до 4000 символів.»*
+3. Бот показує прев'ю та inline-кнопки:
+   ```
+   Прев'ю повідомлення:
+   ─────────────────────
+   {текст}
+   ─────────────────────
+   
+   [ ✅ Підтвердити і надіслати ] [ ❌ Скасувати ]
+   ```
+4. При «Підтвердити» — додати задачі в чергу, повернутися до головного меню, відповісти:
+   ```
+   ✅ Розсилку запущено. Результат отримаєте після завершення.
+   ```
+5. При «Скасувати» — скинути стан FSM, повідомлення: *«Розсилку скасовано.»*
+
+### 12.3. Черга та throttling
+
+- Singleton `asyncio.Queue` (`broadcast_queue`) створюється при старті застосунку в `main.py` і зберігається в `aiohttp` app state: `app["broadcast_queue"] = asyncio.Queue()`.
+- **Два** worker-корутини запускаються в `on_startup` і зупиняються в `on_cleanup`. Кожен worker обслуговує власний елемент черги. Порядок надсилання не гарантований між двома workers, але для одного отримувача це не критично.
+- Кожне завдання у черзі:
+  ```python
+  @dataclass
+  class BroadcastTask:
+      sender_id: int    # telegram_id ініціатора (для звіту)
+      chat_ids: list[int]  # список telegram_id отримувачів
+      text: str
+      retry_count: int = 0
+  ```
+- Throttling між відправками: `await asyncio.sleep(0.05)` між кожними двома повідомленнями в кожному worker (≤ 20 повідомлень/сек сумарно на двох workers).
+- **Обробка помилок:**
+  - `TelegramRetryAfter` (FloodWait) — чекати рівно `exception.retry_after` секунд, потім повторити (не збільшувати `retry_count`).
+  - `TelegramForbiddenError` (403, «bot was blocked by user») — **НЕ повторювати**, логувати `WARNING`, пропускати цього отримувача.
+  - Інші помилки — максимум 3 повторні спроби для кожного повідомлення з exponential backoff (1 с, 2 с, 4 с), збільшуючи `retry_count`.
+- Якщо повідомлення не вдалося надіслати після 3 спроб — записати в `failed_jobs` (`job_type = 'broadcast'`, `payload = {"chat_id": ..., "text_len": ...}`).
+- Розсилка виконується тільки для `students` де `is_active = true AND telegram_id IS NOT NULL`.
+
+### 12.4. Повідомлення про результат
+
+Після завершення розсилки ініціатору надсилається звіт (надсилається в особисті, не в групу):
+
+```
+✅ Розсилку завершено.
+
+📤 Надіслано: 23 з 25 учнів.
+❌ Помилки: 2 (заблокували бота або недоступні).
+```
+
+---
+
+## 13. Чергування
+
+### 13.1. Алгоритм розрахунку трійки чергових
+
+**Вхідні дані:** `target_date: date`, `pool: asyncpg.Pool`.
+
+**Крок 1. Фільтр кандидатів (зі cooldown):**
+
+```sql
+SELECT id FROM students
+WHERE is_active = true
+  AND NOT EXISTS (
+      SELECT 1 FROM absence_log
+      WHERE student_id = students.id
+        AND absent_date = $target_date
+        AND is_cancelled = false
+  )
+  AND (last_duty_date IS NULL OR last_duty_date < $target_date - INTERVAL '1 day')
+ORDER BY consecutive_duty_skip DESC, last_duty_date ASC NULLS FIRST, id ASC
+LIMIT 3;
+```
+
+Результат: `step1_ids = [...]` (0, 1, 2 або 3 елементи).
+
+**Крок 2. Fallback без cooldown (якщо `len(step1_ids) < 3`):**
+
+```sql
+SELECT id FROM students
+WHERE is_active = true
+  AND NOT EXISTS (
+      SELECT 1 FROM absence_log
+      WHERE student_id = students.id
+        AND absent_date = $target_date
+        AND is_cancelled = false
+  )
+  AND id != ALL($step1_ids)   -- виключаємо вже обраних
+ORDER BY consecutive_duty_skip DESC, last_duty_date ASC NULLS FIRST, id ASC
+LIMIT (3 - $count_step1);
+```
+
+Результат: `step2_ids = [...]`.
+
+`final_duty_ids = step1_ids + step2_ids`.
+
+**Крок 3. Fallback при нестачі кандидатів:**
+
+- Якщо `len(final_duty_ids) < 3`: надіслати тривожне повідомлення всім `SUPER_ADMIN`:
+  ```
+  ⚠️ Увага! Не вистачає учнів для чергування на {target_date}.
+  Призначено тільки {N} осіб (потрібно 3).
+  ```
+  Призначити всіх наявних (`final_duty_ids` такий, який є).
+
+- Якщо `final_duty_ids` порожній (взагалі немає доступних учнів):
+  ```
+  🚨 У системі немає активних учнів, доступних для чергування.
+  Чергування не призначено.
+  ```
+  Припинити виконання.
+
+### 13.2. Вечірній cron (`/cron/evening`, 20:00)
+
+**Виконання:**
+
+1. Перевірити `X-Cron-Token`.
+2. Виконати Redis Lock + `cron_runs` idempotency (п. 5.3).
+3. Визначити `tomorrow = today_kyiv() + timedelta(days=1)`.
+4. Перевірити `is_school_day(tomorrow)`. Якщо ні — завершити:
+   ```json
+   {"status": "skipped", "reason": "not_school_day"}
+   ```
+5. Перевірити наявність активних учнів.
+6. Розрахувати чергових на `tomorrow` за алгоритмом п. 13.1. При розрахунку враховуються **уже відомі відсутні на завтра** (якщо адмін вніс відмітку до 20:00) — умова `AND absent_date = $tomorrow` в `absence_log`.
+7. Сформувати ДЗ на `tomorrow` (за логікою п. 11).
+8. Надіслати повідомлення в `GROUP_CHAT_ID`:
+
+   ```
+   🌙 Вечірній звіт на завтра, {дата} ({Чисельник/Знаменник})
+
+   📚 Домашнє завдання:
+   1️⃣ Геометрія: № 456, 458
+   2️⃣ Хімія: повторити §12–15 🚨
+   3️⃣ Фізкультура: нічого не задано
+
+   🧹 Попередні чергові на завтра:
+   • Коваленко А.
+   • Мельник О.
+   • Шевченко Т.
+
+   ℹ️ Остаточний список буде уточнено вранці (09:45) після відмітки відсутніх.
+   ```
+
+9. **В єдиній транзакції БД:**
+   ```sql
+   INSERT INTO bot_messages (chat_id, message_id, type, duty_date, evening_payload)
+   VALUES ($1, $2, 'evening_duty', $tomorrow, $payload_json)
+   ON CONFLICT (chat_id, type, duty_date)
+   DO UPDATE SET message_id = EXCLUDED.message_id,
+                 evening_payload = EXCLUDED.evening_payload;
+   ```
+   де `$payload_json = {"duty_students": [id1, id2, id3]}`.
+
+### 13.3. Ранковий cron (`/cron/morning`, 09:45)
+
+#### 13.3.1. Дедлайн для відмітки відсутніх
+
+Зміни статусу відсутності (через панель адміна, п. 15.3) впливають на чергування поточного дня **тільки якщо внесені до 09:40**. Зміни після 09:40 враховуються при наступному призначенні чергових. Це пояснюється у UI відповідним попередженням (п. 15.3).
+
+#### 13.3.2. Алгоритм виконання
+
+1. Перевірити `X-Cron-Token`.
+2. Виконати Redis Lock + `cron_runs` idempotency.
+3. Визначити `today = today_kyiv()`.
+4. Перевірити `is_school_day(today)`. Якщо ні — завершити.
+5. Перевірити наявність активних учнів.
+
+**Всі кроки A–D виконуються в єдиній транзакції з `REPEATABLE READ`:**
+
+```python
+async with pool.acquire() as conn:
+    async with conn.transaction(isolation='repeatable_read'):
+        # Кроки A, B, C, D
+```
+
+**Крок A. Атомарний вибір кандидатів з блокуванням рядків:**
+
+```sql
+-- Спроба 1: з cooldown
+SELECT id FROM students
+WHERE is_active = true
+  AND NOT EXISTS (
+      SELECT 1 FROM absence_log
+      WHERE student_id = students.id
+        AND absent_date = $today
+        AND is_cancelled = false
+  )
+  AND (last_duty_date IS NULL OR last_duty_date < $today - INTERVAL '1 day')
+ORDER BY consecutive_duty_skip DESC, last_duty_date ASC NULLS FIRST, id ASC
+LIMIT 3
+FOR UPDATE;
+```
+
+Результат: `step1_ids`.
+
+Якщо `len(step1_ids) < 3`, виконати спробу 2:
+```sql
+-- Спроба 2: без cooldown, але виключаємо step1_ids
+SELECT id FROM students
+WHERE is_active = true
+  AND NOT EXISTS (
+      SELECT 1 FROM absence_log
+      WHERE student_id = students.id
+        AND absent_date = $today
+        AND is_cancelled = false
+  )
+  AND id != ALL($step1_ids)
+ORDER BY consecutive_duty_skip DESC, last_duty_date ASC NULLS FIRST, id ASC
+LIMIT (3 - count(step1_ids))
+FOR UPDATE;
+```
+
+`final_duty_ids = step1_ids + step2_ids`.
+
+**Крок B. Отримання вечірнього payload та визначення змін:**
+
+```sql
+SELECT message_id, evening_payload
+FROM bot_messages
+WHERE chat_id = $GROUP_CHAT_ID
+  AND type = 'evening_duty'
+  AND duty_date = $today;
+```
+
+- **Якщо запис відсутній** (вечірній cron не виконався):
+  - Логувати `WARNING: "Вечірній звіт на {today} не знайдено."`.
+  - Надіслати адмінам: *«⚠️ Вечірній звіт на {today} не знайдено. Крок інкременту пропусків пропущено.»*
+  - Встановити `evening_ids = []`, `absent_from_evening = []`.
+  - **Крок D пропускається** (немає бази для визначення, хто «пропустив»).
+  - Всі `final_duty_ids` записуються зі статусом `'pending'` як нові (крок C).
+
+- **Якщо запис є:**
+  - `evening_ids = evening_payload["duty_students"]` (список int).
+  - Знайти відсутніх серед тих, хто був у вечірньому списку:
+    ```sql
+    SELECT student_id FROM absence_log
+    WHERE student_id = ANY($evening_ids)
+      AND absent_date = $today
+      AND is_cancelled = false;
+    ```
+    Результат: `absent_from_evening = [...]`.
+
+**Крок C. Запис у `duty_log`:**
+
+Логіка розподілу статусів:
+
+- `new_in_morning = [id for id in final_duty_ids if id not in evening_ids]` — нові черговї, яких не було увечері (замінюючі відсутніх).
+- `confirmed_from_evening = [id for id in final_duty_ids if id in evening_ids]` — підтверджені з вечірнього списку (присутні).
+- `absent_without_replacement = [id for id in absent_from_evening if id not in [pair[0] for pair in replacement_pairs]]` — відсутні, для яких не знайшлося замінюючого.
+
+**Матчинг «відсутній → замінюючий»:** сортуємо `absent_from_evening` за `id ASC`, сортуємо `new_in_morning` за `id ASC`. Попарно: `absent_from_evening[0]` → `new_in_morning[0]`, `absent_from_evening[1]` → `new_in_morning[1]` і т.д. Якщо кількості не збігаються — пари утворюються тільки до меншої кількості, решта — без пари.
+
+```python
+replacement_pairs = list(zip(
+    sorted(absent_from_evening),
+    sorted(new_in_morning)
+))
+# [(absent_id_1, replacement_id_1), (absent_id_2, replacement_id_2), ...]
+```
+
+Запис у `duty_log`:
+
+```sql
+-- Для кожної пари (absent_id, replacement_id):
+-- 1. Відсутній зі статусом 'replaced'
+INSERT INTO duty_log (duty_date, student_id, status, replaced_by_id)
+VALUES ($today, $absent_id, 'replaced', $replacement_id)
+ON CONFLICT (duty_date, student_id)
+DO UPDATE SET status = 'replaced', replaced_by_id = EXCLUDED.replaced_by_id, updated_at = now();
+
+-- 2. Замінюючий зі статусом 'pending'
+INSERT INTO duty_log (duty_date, student_id, status, replaced_by_id)
+VALUES ($today, $replacement_id, 'pending', NULL)
+ON CONFLICT (duty_date, student_id) DO NOTHING;
+
+-- Для підтверджених з вечірнього списку (present):
+INSERT INTO duty_log (duty_date, student_id, status, replaced_by_id)
+VALUES ($today, $confirmed_id, 'pending', NULL)
+ON CONFLICT (duty_date, student_id) DO NOTHING;
+
+-- Для відсутніх без замінюючого:
+INSERT INTO duty_log (duty_date, student_id, status, replaced_by_id)
+VALUES ($today, $absent_no_replacement_id, 'absent', NULL)
+ON CONFLICT (duty_date, student_id)
+DO UPDATE SET status = 'absent', updated_at = now();
+```
+
+**Крок D. Інкремент `consecutive_duty_skip` (тільки якщо вечірній запис є):**
+
+```sql
+-- Для кожного absent_id з absent_from_evening:
+UPDATE students
+SET consecutive_duty_skip = consecutive_duty_skip + 1,
+    updated_at = now()
+WHERE id = $absent_id;
+```
+
+**COMMIT транзакції.**
+
+При будь-якій помилці — `ROLLBACK`. Повторити до 3 разів з backoff (1, 2, 4 с). Після 3 невдалих спроб — записати в `failed_jobs`, надіслати адмінам: *«🚨 Ранковий cron не виконався.»*
+
+**Крок E. Оновлення повідомлення в груповому чаті (поза транзакцією):**
+
+1. Знайти в `bot_messages` запис `type = 'evening_duty'`, `duty_date = today`.
+2. Сформувати новий текст повідомлення з актуальним списком чергових (з урахуванням замін).
+3. Якщо список чергових **змінився** відносно `evening_ids`:
+   - Додати до тексту: *«⚠️ Увага! Склад чергових скориговано з урахуванням відсутніх.»*
+4. **Якщо запис в `bot_messages` є:**
+   - Викликати `editMessageText(chat_id, message_id, text)`.
+   - При `MessageNotModified` — ігнорувати.
+   - При інших помилках Telegram API — видалити запис з `bot_messages`, надіслати **нове** повідомлення, зберегти новий `message_id` в `bot_messages`.
+5. **Якщо запис в `bot_messages` відсутній (вечірній cron не виконався):**
+   - Надіслати нове повідомлення з актуальним списком.
+   - Зберегти `message_id` в `bot_messages`.
+6. Якщо надсилання нового повідомлення також не вдалося — записати в `failed_jobs`.
+
+### 13.4. Підтвердження виконання чергування
+
+**Доступ:** кнопка «✅ Відмітити чергування» в підменю «🧹 Чергування».
+
+**Flow:**
+
+1. Вибір дати (inline-кнопки: `[ 📅 Сьогодні ] [ 🗓 Інша дата ]`).
+2. При «Інша дата» — запит: *«Введіть дату (ДД.ММ.РРРР):»* з валідацією.
+3. Показати список учнів зі статусом `'pending'` у `duty_log` за цю дату. Якщо список порожній: *«📭 Немає чергових зі статусом «Очікує підтвердження» на цю дату.»*
+4. Вибір учня (inline-кнопки).
+5. Підтвердження: *«Підтвердити чергування {full_name} на {дата}?»* + `[ ✅ Так ] [ ❌ Ні ]`.
+6. Після підтвердження — **в одній транзакції:**
+   ```sql
+   UPDATE duty_log
+   SET status = 'completed', updated_at = now()
+   WHERE duty_date = $date AND student_id = $id AND status = 'pending';
+
+   UPDATE students
+   SET last_duty_date = $date,
+       consecutive_duty_skip = 0,
+       updated_at = now()
+   WHERE id = $id;
+   ```
+7. Відповідь: *«✅ Чергування {full_name} підтверджено!»*
+
+**Права:**
+- `zamstarosta`, `starosta`, `super_admin` — можуть підтвердити для будь-якого учня.
+- `student`, `redactor` — лише **своє** чергування (де `duty_log.student_id` = `students.id` поточного користувача).
+
+### 13.5. Підменю «🧹 Чергування» (перегляд)
+
+```
+[ 📆 Чергові на сьогодні ] [ 📅 Чергові на завтра  ]
+[ 🗓 Історія за 5 днів   ] [ ✅ Відмітити чергування ]
+```
+
+**Чергові на сьогодні:**
+Відображає фактичний список із `duty_log` за сьогодні зі статусами:
+```
+🧹 Чергові на сьогодні (23.04):
+
+• Коваленко А. ⏳ (очікує)
+• Мельник О. ✅ (виконано)
+• Кравчук О. ⏳ (замість відсутнього Петренка С.)
+```
+
+**Чергові на завтра:**
+- Якщо завтра ненавчальний день: *«Завтра ненавчальний день, чергування не призначено.»*
+- Якщо навчальний, але вечірній cron не виконався (немає запису в `bot_messages` з `duty_date = tomorrow`): *«Чергові на завтра ще не визначені. Спробуйте після 20:00.»*
+- Якщо є — відобразити список з `evening_payload`.
+
+**Історія за 5 днів:**
+
+```
+🗓 Історія чергувань (18.04 – 22.04):
+
+🔹 Пт, 18.04:
+  • Шевченко Т. ✅ (виконано)
+  • Кравчук О. ✅ (замість Франка І.)
+  • Франко І. ↩️ (замінений)
+
+🔹 Пн, 21.04:
+  • Костенко Л. ⏳ (очікує)
+  • Мельник О. ⏳ (очікує)
+
+🔹 Вт, 22.04: немає записів
+```
+
+Статуси: ✅ completed, ⏳ pending, ↩️ replaced, 🚫 absent.
+
+---
+
+## 14. Cron скидання навчального року (`/cron/reset_academic_year`)
+
+### 14.1. Умова виконання
+
+Виконується автоматично 1 вересня о 00:05 за Europe/Kyiv. Idempotency через `cron_runs` та Redis Lock (п. 5.3).
+
+### 14.2. Дії (у порядку виконання)
+
+**Дія 1. Перевірки перед виконанням:**
+
+```python
+today = today_kyiv()
+# Захист від ненавмисного виклику не 1 вересня
+if today.month != 9 or today.day != 1:
+    logger.error(f"reset_academic_year викликано не 1 вересня: {today}")
+    notify_admins("⚠️ reset_academic_year викликано не 1 вересня!")
+    return HTTP 200 {"status": "skipped", "reason": "not_september_1"}
+
+# Перевірка, що academic_year_start у минулому
+class_info = await get_class_info()
+if class_info.academic_year_start >= today:
+    logger.error("academic_year_start не менше поточної дати")
+    notify_admins("⚠️ Скидання навчального року неможливе: academic_year_start >= today")
+    return HTTP 200 {"status": "skipped", "reason": "invalid_academic_year_start"}
+```
+
+**Дія 2. Скидання чергувань:**
+
+```sql
+UPDATE students
+SET last_duty_date = NULL,
+    consecutive_duty_skip = 0,
+    updated_at = now()
+WHERE is_active = true;
+```
+
+**Дія 3. Архівування `duty_log` (в одній транзакції):**
+
+```sql
+BEGIN;
+
+INSERT INTO duty_log_archive (id, duty_date, student_id, status, replaced_by_id, created_at, updated_at)
+SELECT id, duty_date, student_id, status, replaced_by_id, created_at, updated_at
+FROM duty_log
+WHERE duty_date < (SELECT academic_year_start FROM class_info WHERE id = 1);
+
+DELETE FROM duty_log
+WHERE duty_date < (SELECT academic_year_start FROM class_info WHERE id = 1);
+
+COMMIT;
+```
+
+Зберегти кількість переміщених записів для звіту адмінам.
+
+**Дія 4. Оновлення `week_config`:**
+
+`semester_start` встановлюється на 1 вересня поточного року. `first_week_type` залишається без змін (або встановлюється адміном вручну перед початком навчального року):
+
+```sql
+INSERT INTO week_config (id, semester_start, first_week_type, is_active)
+VALUES (1, $september_1, (SELECT first_week_type FROM week_config WHERE id = 1), true)
+ON CONFLICT (id) DO UPDATE
+SET semester_start = EXCLUDED.semester_start,
+    is_active = true;
+```
+
+**Дія 5. Автоматичне збільшення номера класу:**
+
+```python
+if class_info.class_number < 11:
+    await pool.execute(
+        """
+        UPDATE class_info
+        SET class_number = class_number + 1,
+            academic_year_start = $1
+        WHERE id = 1
+        """,
+        september_1
+    )
+    new_number = class_info.class_number + 1
+else:
+    # 11-й клас — не змінювати автоматично
+    new_number = class_info.class_number
+    await notify_admins(
+        "🎓 Клас досяг 11-го року навчання.\n"
+        "Автоматичне оновлення не виконано.\n"
+        "Налаштуйте вручну через /admin → Редагувати назву класу."
+    )
+```
+
+**Дія 6. Повідомлення адмінам:**
+
+```
+✅ Скидання навчального року виконано ({дата} {час}):
+
+• Чергування скинуто для всіх активних учнів.
+• duty_log заархівовано: {N} записів.
+• Клас оновлено: {старий}-{літера} → {новий}-{літера}.
+• semester_start у week_config: {дата}.
+```
+
+---
+
+## 15. Адміністративна панель
+
+### 15.1. Доступ
+
+Тільки для `SUPER_ADMIN_IDS`. Панель викликається командою `/admin` або кнопкою `⚙️ Адмін-панель` в головному меню.
+
+### 15.2. Головне меню адміністратора (inline-клавіатура)
+
+```
+[ 🩺 Відмітити відсутніх сьогодні   ]
+[ 📝 Редагувати ДЗ                  ]
+[ 👥 Керування класом               ]
+[ 🔄 Скинути борги чергувань        ]
+[ 🗓 Канікули                       ]
+[ 🏷 Редагувати назву класу         ]
+[ ↩️ Назад до головного меню        ]
+```
+
+### 15.3. Відмітка відсутніх сьогодні
+
+**Відображення:**
+
+- Показати список активних учнів (`is_active = true`, `ORDER BY full_name ASC`) з inline-кнопками-перемикачами для кожного:
+  ```
+  [ ✅ Коваленко А. ]   ← присутній (зелений)
+  [ ❌ Мельник О.   ]   ← відсутній (червоний)
+  ```
+  Натискання кнопки перемикає стан. Поточний стан беремо з `absence_log` при завантаженні списку.
+
+- Якщо поточний час ≥ 09:40 (Kyiv), показати попередження над списком:
+  ```
+  ⚠️ Зараз після 09:40. Зміни не вплинуть на чергування сьогодні.
+  Вони будуть враховані наступного навчального дня.
+  ```
+
+- Кнопки підтвердження внизу:
+  ```
+  [ ✅ Зберегти зміни ] [ ❌ Скасувати ]
+  ```
+
+**Підтвердження перед збереженням:**
+
+Показати прев'ю змін та запитати підтвердження:
+
+```
+Будуть позначені відсутніми:
+• Мельник О.
+• Іваненко І.
+
+Будуть позначені присутніми:
+• Петренко П.
+
+[ ✅ Підтвердити ] [ ❌ Скасувати ]
+```
+
+**Транзакція збереження:**
+
+Для кожного учня, стан якого змінився:
+
+**Позначити відсутнім:**
+
+```sql
+-- Атомарно встановлюємо відмітку в absence_log.
+-- Тригер trg_sync_absent_cache автоматично оновить students.absent_date та updated_at.
+INSERT INTO absence_log (student_id, absent_date, is_cancelled)
+VALUES ($student_id, CURRENT_DATE, false)
+ON CONFLICT (student_id, absent_date)
+DO UPDATE SET is_cancelled = false, updated_at = now();
+```
+
+**Позначити присутнім (скасувати відмітку):**
+
+```sql
+-- Скасовуємо запис в absence_log (soft delete, зберігається для аудиту).
+-- Тригер trg_sync_absent_cache автоматично скине students.absent_date та updated_at.
+UPDATE absence_log
+SET is_cancelled = true, updated_at = now()
+WHERE student_id = $student_id AND absent_date = CURRENT_DATE;
+```
+
+**Оптимістичне блокування для паралельного редагування:**
+
+Якщо два адміни одночасно відкрили список відсутніх, необхідно виявити конфлікт. Для кожного учня, стан якого адмін змінює, перед збереженням перевірити поточний стан `absence_log`:
+
+```sql
+SELECT is_cancelled, updated_at
+FROM absence_log
+WHERE student_id = $student_id AND absent_date = CURRENT_DATE;
+```
+
+Якщо запис відсутній або `is_cancelled` збігається з тим, що зберігає адмін (тобто зміна вже зроблена іншим) — пропустити без помилки (ідемпотентна операція). Якщо `updated_at` відрізняється від завантаженого раніше — надіслати попередження адміну: *«⚠️ Дані учня {full_name} були змінені іншим адміністратором. Перевірте актуальний стан.»* і оновити відображення.
+
+**Після збереження:** відповідь:
+
+```
+✅ Відмітку збережено:
+• Відсутні: Мельник О., Іваненко І.
+• Присутні (скасовано відмітку): Петренко П.
+```
+
+### 15.4. Редагування домашнього завдання
+
+Підменю:
+```
+[ ➕ Додати ДЗ ] [ ✏️ Змінити ДЗ ] [ 🗑 Видалити ДЗ ]
+```
+
+**Додавання (FSM: `AddHomework`):**
+
+1. Вибір предмета (inline-кнопки зі списку `subjects`, відсортованих за `name ASC`).
+2. Введення дати (`ДД.ММ.РРРР`). Валідація: правильний формат + реальна дата.
+3. Введення тексту (до 500 символів). Показати лічильник: *«Введено: 150/500 символів.»*
+4. Вибір типу: `[ 🚨 Контрольна робота ] [ 📝 Звичайне ДЗ ]`.
+5. Підтвердження:
+   ```
+   📚 Нове домашнє завдання:
+   Предмет: Математика
+   Дата: 25.04.2025
+   Тип: 🚨 Контрольна
+   Текст: повторити §12–15
+
+   [ ✅ Зберегти ] [ ❌ Скасувати ]
+   ```
+6. При підтвердженні:
+   ```sql
+   INSERT INTO homework (subject_id, due_date, description, is_control, added_by)
+   VALUES ($1, $2, $3, $4, $5);
+   ```
+
+**Зміна (FSM: `EditHomework`):**
+
+1. Показати список ДЗ (`is_active = true`) за найближчі 14 днів від сьогодні.
+2. Вибір запису → вибір поля: `[ 📅 Змінити дату ] [ 📝 Змінити текст ] [ 🔀 Змінити тип ]`.
+3. Введення нового значення → підтвердження → `UPDATE homework SET {field} = $1 WHERE id = $2`.
+
+**Видалення (soft delete):**
+
+1. Показати список ДЗ (`is_active = true`) за найближчі 14 днів.
+2. Вибір записів (multiple select через inline-кнопки з ✅/☐).
+3. Підтвердження: *«Видалити {N} запис(ів)?»* + `[ ✅ Так ] [ ❌ Ні ]`.
+4. `UPDATE homework SET is_active = false WHERE id = ANY($ids)`.
+
+### 15.5. Керування класом
+
+**Перегляд:** список учнів з `id`, `full_name`, `role`, `group_name`, `telegram_id` (або `—`), `is_active`.
+
+**Додати учня (FSM: `AddStudent`):**
+
+1. ПІБ (TextInput, 2–100 символів).
+2. Підгрупа: `[ A ] [ B ] [ Без підгрупи ]` (відповідає `'A'`, `'B'`, `'all'`).
+3. Роль: `[ Учень ] [ Заст. старости ] [ Редактор ] [ Староста ]`.
+4. Telegram ID (TextInput; `[ /skip ]` для пропуску → залишити `NULL`).
+5. Підтвердження:
+   ```
+   Новий учень:
+   ПІБ: Коваленко Андрій Іванович
+   Підгрупа: A
+   Роль: Учень
+   Telegram ID: 123456789
+
+   [ ✅ Зберегти ] [ ❌ Скасувати ]
+   ```
+6. При підтвердженні:
+   - Перевірити на рівні застосунку: чи немає вже активного старости (якщо роль = `'starosta'`). Якщо є — *«❌ Активний староста вже існує. Спочатку деактивуйте або змініть роль поточного старости.»*
+   - `INSERT INTO students (full_name, telegram_id, role, group_name) VALUES ($1, $2, $3, $4)`.
+   - Якщо БД повертає `unique_violation` по `one_starosta` — показати ту ж помилку.
+
+**Змінити дані учня:**
+
+1. Вибір учня (inline-список).
+2. Підменю:
+   ```
+   [ 🔀 Змінити роль      ] [ 👥 Змінити підгрупу  ]
+   [ 📲 Встановити TG ID  ] [ 🚫 Деактивувати      ]
+   ```
+3. **Деактивація** (`is_active = false`) — запитати підтвердження. Поля `telegram_id`, `role`, `group_name` зберігаються для аудиту.
+4. **Зміна ролі** — якщо нова роль `'starosta'` і є вже активний — показати помилку (п. 15.5).
+
+### 15.6. Скинути борги чергувань
+
+1. Показати список учнів з `consecutive_duty_skip > 0` і значеннями пропусків.
+2. Inline-кнопки: кожен учень окремо + `[ Скинути всім ]`.
+3. Підтвердження → `UPDATE students SET consecutive_duty_skip = 0 WHERE id = ANY($ids)`.
+
+### 15.7. Канікули
+
+**Перегляд:** список існуючих записів у `holidays`, відсортованих за `start_date ASC`.
+
+**Додати (FSM: `AddHoliday`):**
+
+1. Введення `start_date` (`ДД.ММ.РРРР`).
+2. Введення `end_date` (`ДД.ММ.РРРР`). Валідація: `end_date >= start_date`.
+3. Введення опису (опціонально; `/skip` для пропуску).
+4. Підтвердження → `INSERT INTO holidays (start_date, end_date, description) VALUES ($1, $2, $3)`.
+
+**Видалити:**
+
+1. Вибір запису з inline-списку.
+2. Підтвердження → `DELETE FROM holidays WHERE id = $1`.
+
+### 15.8. Редагувати назву класу (FSM: `EditClassName`)
+
+1. Показати поточну назву: *«Поточна назва: 7-А. Введіть новий номер класу (1–11):»*
+2. Введення номера. Валідація: ціле число від 1 до 11.
+3. Введення літери. Валідація: 1–2 символи (будь-яка літера).
+4. Підтвердження:
+   ```
+   Нова назва класу: 8-А
+   
+   [ ✅ Зберегти ] [ ❌ Скасувати ]
+   ```
+5. `UPDATE class_info SET class_number = $1, class_letter = $2 WHERE id = 1`.
+
+---
+
+## 16. FSM стани
+
+Використовується `RedisStorage` від aiogram 3.x. Всі FSM-стани зберігаються в Redis.
+
+### 16.1. Таймаут стану — 5 хвилин
+
+При вході в кожен новий FSM-стан TTL відповідного Redis-ключа встановлюється в 300 секунд. В aiogram 3.x `RedisStorage` підтримує параметр `state_ttl` та `data_ttl`:
+
+```python
+from aiogram.fsm.storage.redis import RedisStorage
+
+storage = RedisStorage.from_url(
+    url=settings.REDIS_URL,
+    key_builder=DefaultKeyBuilder(with_destiny=True),
+    state_ttl=300,   # TTL для ключа стану (секунди)
+    data_ttl=300,    # TTL для ключа даних стану (секунди)
+)
+```
+
+`FsmTimeoutMiddleware` (п. 17.4) перевіряє наявність активного стану перед кожним повідомленням. Якщо стан зник (TTL вийшов) — надсилає повідомлення: *«⏰ Сесію завершено (тайм-аут 5 хвилин). Натисніть /start для початку.»* — і скидає стан.
+
+### 16.2. Гарантія атомарності
+
+Всі зміни в БД у рамках FSM виконуються **виключно на фінальному кроці підтвердження**. Проміжні дані (введений текст, вибрані значення) зберігаються лише в Redis FSM Storage через `await state.update_data(key=value)`. Це запобігає частковому збереженню при таймауті або скасуванні.
+
+### 16.3. Перелік станів
+
+**`AddHomework`:**
+```
+waiting_subject → waiting_date → waiting_text → waiting_is_control → waiting_confirm
+```
+
+**`EditHomework`:**
+```
+waiting_select_record → waiting_field → waiting_new_value → waiting_confirm
+```
+
+**`Broadcast`:**
+```
+waiting_text → waiting_confirm
+```
+
+**`AddStudent`:**
+```
+waiting_name → waiting_group → waiting_role → waiting_telegram_id → waiting_confirm
+```
+
+**`EditClassName`:**
+```
+waiting_number → waiting_letter → waiting_confirm
+```
+
+**`AddHoliday`:**
+```
+waiting_start_date → waiting_end_date → waiting_description → waiting_confirm
+```
+
+**`ConfirmDuty`:**
+```
+waiting_date → waiting_student → waiting_confirm
+```
+
+**`GetHomeworkByDate`:**
+```
+waiting_date
+```
+
+---
+
+## 17. Middleware стек
+
+Middleware реєструються у `bot/middlewares/__init__.py` і підключаються до `Dispatcher` в `main.py`. Порядок виконання (outer → inner, тобто від першого зареєстрованого до останнього):
+
+### 17.1. `WebhookIdempotencyMiddleware`
+
+Рівень: **outer** (до всієї обробки).
+
+- Перевіряє `processed_update:{update_id}` в Redis.
+- Якщо ключ є — пропускає обробку (не передає далі), повертає без виклику наступних middleware та хендлерів.
+- Якщо Redis недоступний — логує `WARNING`, пропускає перевірку (не блокує).
+
+### 17.2. `DatabaseMiddleware`
+
+Рівень: **outer**.
+
+- Отримує `asyncpg` connection з pool: `conn = await pool.acquire()`.
+- Передає з'єднання в `data['db']`.
+- Після обробки (у `finally`) — `await pool.release(conn)`.
+
+### 17.3. `AuthMiddleware`
+
+Рівень: **inner**.
+
+- Завантажує запис `student` з БД за `telegram_id` (спочатку з Redis-кешу `student_cache:{telegram_id}`, TTL 60 с; при промаху — з БД і записує в кеш).
+- Записує в `data['student']` (або `None` для незареєстрованих).
+- Записує в `data['is_super_admin']` = `telegram_id in settings.super_admin_ids_set`.
+- Перевірка доступу до `/admin` і admin-хендлерів: якщо `not is_super_admin` — відповідь: *«🚫 Недостатньо прав для цієї дії.»*
+
+### 17.4. `FsmTimeoutMiddleware`
+
+Рівень: **inner**.
+
+- Перевіряє наявність активного FSM-стану через `await state.get_state()`.
+- Якщо стан повертає `None`, але попередній запит користувача стан мав (можна перевірити через `data.get('fsm_state_before')`) — вважаємо тайм-аут.
+- Спрощена логіка: якщо хендлер очікував на введення (стан FSM не `None` у попередньому запиті), але зараз стан `None` — тайм-аут. В практичному сенсі: middleware не повинен перехоплювати нові взаємодії поза FSM, тому перевіряє лише якщо поточний стан `None`, але при цьому це не `Message` з командою `/start`.
+
+### 17.5. `ThrottlingMiddleware`
+
+Рівень: **inner**.
+
+- Загальний rate limit: не більше 3 повідомлень за 3 секунди від одного `user_id`.
+- Redis-ключ: `throttle:{user_id}`, TTL 3 с, значення = лічильник (`INCR` + `EXPIRE`).
+- При перевищенні: *«🐢 Надто багато запитів. Зачекайте кілька секунд.»*
+- При недоступності Redis — пропускати перевірку (`WARNING`).
+
+### 17.6. `CallbackIdempotencyMiddleware`
+
+Рівень: **inner** (тільки для `CallbackQueryUpdate`).
+
+- Перевіряє `callback_processed:{callback_id}` в Redis.
+- Якщо ключ є — ігнорує callback: `await callback.answer()` і не передає далі.
+- Якщо ключ відсутній — встановлює ключ (`SET NX EX 60`) і передає далі.
+- При недоступності Redis — логує `WARNING`, пропускає перевірку.
+
+---
+
+## 18. UX вимоги
+
+- **Стиль форматування:** `parse_mode = ParseMode.HTML` для всіх повідомлень бота. Дані, отримані від користувача (ПІБ, текст ДЗ, текст розсилки), обов'язково екранувати через `html.escape()` перед відображенням у повідомленнях.
+- **Порожні стани:** замість порожніх повідомлень виводити `📭 Даних немає`.
+- **Завантаження:** перед тривалими операціями (запити до БД > 1 с) надсилати `await bot.send_chat_action(chat_id, "typing")`. При потребі — тимчасове повідомлення `⏳ Завантажую...` з подальшим редагуванням.
+- **Підтвердження дій:** усі деструктивні або незворотні дії (видалення, підтвердження чергування, збереження відмітки відсутніх, розсилка) вимагають явного підтвердження через inline-кнопки `[ ✅ Так, підтвердити ] [ ❌ Скасувати ]`.
+- **Мова:** усі тексти бота — **українською мовою**.
+- **Навігація:** у кожному підменю присутня кнопка `[ ↩️ Назад ]` або `[ 🏠 Головне меню ]`.
+- **Невідомі команди та текст поза FSM:** відповідати: *«Я не розумію цю команду. Скористайтеся меню нижче 👇»* і показувати reply-клавіатуру головного меню. Реалізується в `bot/handlers/common.py` через `@router.message()` без фільтрів (найнижчий пріоритет).
+- **Callback_query:** завжди викликати `await callback.answer()` (щоб кнопка не «крутилася» нескінченно), навіть якщо відповідь порожня. Виконується навіть при помилках.
+- **Довгі списки:** якщо список учнів > 30 рядків, розбивати на сторінки по 15 (inline-кнопки `[ ◀️ Попередня ] [ ▶️ Наступна ]`).
+- **Часові мітки:** всі дати і часи, що відображаються користувачу, виводити в часовому поясі Europe/Kyiv.
+
+---
+
+## 19. Обробка помилок
+
+### 19.1. Помилки бази даних
+
+- Будь-яка `asyncpg.PostgresError` логується з рівнем `ERROR` (зі stack trace).
+- Користувачеві: *«❌ Сталася технічна помилка. Спробуйте пізніше.»* (без технічних деталей).
+- **Retry з exponential backoff** (1, 2, 4 с; max 3 спроби) для:
+  - `asyncpg.SerializationError`
+  - `asyncpg.DeadlockDetectedError`
+  - Конфліктів optimistic locking.
+
+### 19.2. Помилки Telegram API
+
+- `TelegramRetryAfter` (FloodWait): чекати рівно `exception.retry_after` секунд, повторити (не збільшувати `retry_count`).
+- `TelegramNetworkError`, `asyncio.TimeoutError`: exponential backoff (1, 2, 4 с), max 3 спроби.
+- `TelegramForbiddenError` (403) — **НЕ повторювати**, логувати `WARNING`, пропускати.
+- Після 3 невдалих спроб: логувати `ERROR`, записати в `failed_jobs`, при інтерактивній дії показати: *«❌ Не вдалося надіслати повідомлення. Спробуйте пізніше.»*
+
+### 19.3. Помилки Redis
+
+- Exponential backoff (0.1, 0.2, 0.4 с), max 3 спроби.
+- Після 3 невдалих спроб — деградований режим (п. 24.1).
+
+### 19.4. Глобальний exception handler
+
+Реалізується через `ErrorsRouter` aiogram 3.x і реєструється в Dispatcher:
+
+```python
+from aiogram import Router
+from aiogram.types import ErrorEvent
+
+errors_router = Router()
+
+@errors_router.error()
+async def global_error_handler(event: ErrorEvent):
+    exception = event.exception
+    update = event.update
+
+    logger.critical(
+        f"Непередбачений виняток: {type(exception).__name__}: {exception}",
+        exc_info=True
+    )
+
+    # Записати в failed_jobs
+    await save_failed_job(
+        job_type='exception',
+        payload={"update_id": getattr(update, 'update_id', None)},
+        error=str(exception)
+    )
+
+    # Сповістити super_admins
+    for admin_id in settings.SUPER_ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🚨 Критична помилка:\n"
+                f"{type(exception).__name__}: {str(exception)[:200]}\n"
+                f"Update ID: {getattr(update, 'update_id', '?')}"
+            )
+        except Exception:
+            pass
+
+    # Відповісти користувачеві, якщо можливо
+    if update.message:
+        try:
+            await update.message.answer("❌ Сталася непередбачена помилка. Адміністратора сповіщено.")
+        except Exception:
+            pass
+    elif update.callback_query:
+        try:
+            await update.callback_query.answer("❌ Непередбачена помилка.", show_alert=True)
+        except Exception:
+            pass
+```
+
+---
+
+## 20. Логування
+
+### 20.1. Конфігурація
+
+```python
+import logging
+import os
+from logging.handlers import RotatingFileHandler
+
+os.makedirs("logs", exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        RotatingFileHandler(
+            "logs/bot.log",
+            maxBytes=10 * 1024 * 1024,  # 10 MB
+            backupCount=5,
+            encoding="utf-8"
+        ),
+        logging.StreamHandler()  # також виводити в stdout (для Render logs)
+    ]
+)
+
+# Окремий logger для адмінських дій
+admin_logger = logging.getLogger("admin")
+admin_logger.addHandler(
+    RotatingFileHandler(
+        "logs/admin.log",
+        maxBytes=5 * 1024 * 1024,   # 5 MB
+        backupCount=3,
+        encoding="utf-8"
+    )
+)
+```
+
+### 20.2. Рівні логування
+
+| Рівень | Що логується |
+|---|---|
+| `DEBUG` | Кожен отриманий update (тільки `update_id`). Кеш Redis: hit/miss, TTL. |
+| `INFO` | Запуск бота, встановлення webhook, реєстрація команд. Виконання cron (початок/кінець, результати). Успішні дії адмінів. Відправка розсилки (кількість надісланих). |
+| `WARNING` | Повторні спроби (retry). Невірний токен cron/webhook (з IP-адресою). Тайм-аут FSM. Redis недоступний. Заблокував бот (403). |
+| `ERROR` | Помилки БД. Невдалі відправки після 3 спроб. Винятки в хендлерах. |
+| `CRITICAL` | Невдала перевірка при старті. Непередбачений виняток у global handler. |
+
+### 20.3. Формат запису адмінських дій
+
+```python
+admin_logger.info(
+    "user_id=%d | action=%s | %s",
+    user_id,
+    action_name,
+    " | ".join(f"{k}={v}" for k, v in details.items())
+)
+```
+
+Приклади:
+```
+2025-04-23 10:15:32 | INFO | admin | user_id=123456789 | action=mark_absent | students=[1,3,7] | date=2025-04-23
+2025-04-23 10:20:11 | INFO | admin | user_id=123456789 | action=add_homework | subject_id=3 | due_date=2025-04-25
+2025-04-23 10:25:00 | INFO | admin | user_id=123456789 | action=confirm_duty | student_id=5 | duty_date=2025-04-23
+```
+
+### 20.4. Захист конфіденційних даних
+
+У логах **заборонено** зазначати:
+- Текст повідомлень користувачів (`message.text`) — ні цілком, ні частково.
+- Токени (`BOT_TOKEN`, `CRON_SECRET_TOKEN`, `WEBHOOK_SECRET`).
+- Повний вміст `callback_query.data` — допускається логувати лише ім'я дії.
+- Персональні дані (прізвища, Telegram usernames) — лише `student_id` або `user_id`.
+
+---
+
+## 21. Graceful Shutdown
+
+При отриманні сигналів `SIGTERM` або `SIGINT` (реалізується через `on_cleanup` aiohttp Application):
+
+```python
+async def on_cleanup(app: web.Application):
+    logger.info("Graceful shutdown: розпочато")
+
+    # 1. Зупинити прийом нових задач у чергу розсилки
+    app["broadcast_queue_shutdown"] = True
+
+    # 2. Дочекатися завершення черги розсилки (таймаут 15 с)
+    try:
+        await asyncio.wait_for(app["broadcast_queue"].join(), timeout=15.0)
+    except asyncio.TimeoutError:
+        logger.warning("Graceful shutdown: черга розсилки не завершена за 15 с")
+
+    # 3. Зупинити worker-корутини
+    for task in app["broadcast_workers"]:
+        task.cancel()
+    await asyncio.gather(*app["broadcast_workers"], return_exceptions=True)
+
+    # 4. Закрити asyncpg pool
+    await app["db_pool"].close()
+    logger.info("Graceful shutdown: БД пул закрито")
+
+    # 5. Закрити Redis
+    await app["redis"].aclose()
+    logger.info("Graceful shutdown: Redis закрито")
+
+    # 6. Видалити webhook (опціонально; закоментувати при rolling restart)
+    # await bot.delete_webhook()
+
+    logger.info("Graceful shutdown: завершено")
+```
+
+---
+
+## 22. Міграції та початкове наповнення БД
+
+### 22.1. Файл `migrations/001_init_db.sql`
+
+Скрипт є **ідемпотентним** (використовує `IF NOT EXISTS`, `ON CONFLICT DO NOTHING`, `CREATE OR REPLACE`). Безпечно виконувати повторно.
+
+```sql
+-- ============================================================
+-- ClassHelperProBot — Initial Database Setup
+-- Version 9.0 | Idempotent
+-- ============================================================
+
+-- ─────────── ТАБЛИЦІ ───────────
+
+CREATE TABLE IF NOT EXISTS students (
+    id                    SERIAL PRIMARY KEY,
+    full_name             TEXT NOT NULL,
+    telegram_id           BIGINT NULL UNIQUE,
+    role                  TEXT NOT NULL DEFAULT 'student'
+                              CHECK (role IN ('student','starosta','zamstarosta','redactor')),
+    group_name            TEXT NOT NULL DEFAULT 'all'
+                              CHECK (group_name IN ('A', 'B', 'all')),
+    is_active             BOOLEAN NOT NULL DEFAULT true,
+    absent_date           DATE NULL,
+    last_duty_date        DATE NULL,
+    consecutive_duty_skip INT NOT NULL DEFAULT 0,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS absence_log (
+    id           SERIAL PRIMARY KEY,
+    student_id   INT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    absent_date  DATE NOT NULL,
+    is_cancelled BOOLEAN NOT NULL DEFAULT false,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(student_id, absent_date)
+);
+
+CREATE TABLE IF NOT EXISTS subjects (
+    id   SERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS timetable (
+    id          SERIAL PRIMARY KEY,
+    day_of_week INT NOT NULL CHECK (day_of_week BETWEEN 0 AND 6),
+    lesson_num  INT NOT NULL CHECK (lesson_num BETWEEN 1 AND 12),
+    subject_id  INT REFERENCES subjects(id) ON DELETE SET NULL,
+    cabinet     TEXT,
+    teacher     TEXT,
+    week_type   TEXT NOT NULL
+                    CHECK (week_type IN ('numerator', 'denominator', 'both')),
+    group_name  TEXT NOT NULL
+                    CHECK (group_name IN ('A', 'B', 'all')),
+    UNIQUE(day_of_week, lesson_num, week_type, group_name)
+);
+
+CREATE TABLE IF NOT EXISTS homework (
+    id          SERIAL PRIMARY KEY,
+    subject_id  INT REFERENCES subjects(id) ON DELETE SET NULL,
+    due_date    DATE NOT NULL,
+    description TEXT NOT NULL CHECK (length(description) BETWEEN 1 AND 500),
+    is_control  BOOLEAN NOT NULL DEFAULT false,
+    is_active   BOOLEAN NOT NULL DEFAULT true,
+    added_by    BIGINT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS duty_log (
+    id              SERIAL PRIMARY KEY,
+    duty_date       DATE NOT NULL,
+    student_id      INT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    status          TEXT NOT NULL
+                        CHECK (status IN ('pending', 'completed', 'replaced', 'absent')),
+    replaced_by_id  INT NULL REFERENCES students(id) ON DELETE SET NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(duty_date, student_id),
+    CONSTRAINT duty_log_replaced_check CHECK (
+        (status = 'replaced' AND replaced_by_id IS NOT NULL AND replaced_by_id != student_id)
+        OR (status != 'replaced' AND replaced_by_id IS NULL)
+    ),
+    CONSTRAINT duty_log_completed_check CHECK (
+        status != 'completed' OR replaced_by_id IS NULL
+    )
+);
+
+CREATE TABLE IF NOT EXISTS duty_log_archive (
+    id              INT NOT NULL,
+    duty_date       DATE NOT NULL,
+    student_id      INT NOT NULL,
+    status          TEXT NOT NULL,
+    replaced_by_id  INT NULL,
+    created_at      TIMESTAMPTZ NOT NULL,
+    updated_at      TIMESTAMPTZ NOT NULL,
+    archived_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS holidays (
+    id          SERIAL PRIMARY KEY,
+    start_date  DATE NOT NULL,
+    end_date    DATE NOT NULL,
+    description TEXT,
+    CHECK (end_date >= start_date)
+);
+
+CREATE TABLE IF NOT EXISTS bot_messages (
+    id              SERIAL PRIMARY KEY,
+    chat_id         BIGINT NOT NULL,
+    message_id      INT NOT NULL,
+    type            TEXT NOT NULL,
+    duty_date       DATE NOT NULL,
+    evening_payload JSONB NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(chat_id, type, duty_date)
+);
+
+CREATE TABLE IF NOT EXISTS week_config (
+    id              INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    semester_start  DATE NOT NULL,
+    first_week_type TEXT NOT NULL
+                        CHECK (first_week_type IN ('numerator', 'denominator')),
+    is_active       BOOLEAN NOT NULL DEFAULT true
+);
+
+CREATE TABLE IF NOT EXISTS cron_runs (
+    id        SERIAL PRIMARY KEY,
+    endpoint  TEXT NOT NULL,
+    run_date  DATE NOT NULL,
+    ran_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(endpoint, run_date)
+);
+
+CREATE TABLE IF NOT EXISTS class_info (
+    id                  INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    class_number        INT NOT NULL CHECK (class_number BETWEEN 1 AND 11),
+    class_letter        TEXT NOT NULL CHECK (length(class_letter) BETWEEN 1 AND 2),
+    academic_year_start DATE NOT NULL,
+    is_current          BOOLEAN NOT NULL DEFAULT true
+);
+
+CREATE TABLE IF NOT EXISTS failed_jobs (
+    id          SERIAL PRIMARY KEY,
+    job_type    TEXT NOT NULL,
+    payload     JSONB,
+    error       TEXT NOT NULL,
+    attempts    INT NOT NULL DEFAULT 1,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ─────────── ІНДЕКСИ ───────────
+
+CREATE INDEX IF NOT EXISTS idx_students_telegram_id    ON students(telegram_id);
+CREATE INDEX IF NOT EXISTS idx_students_is_active      ON students(is_active);
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_starosta
+    ON students(role)
+    WHERE role = 'starosta' AND is_active = true;
+
+CREATE INDEX IF NOT EXISTS idx_absence_active
+    ON absence_log(student_id, absent_date)
+    WHERE is_cancelled = false;
+
+CREATE INDEX IF NOT EXISTS idx_absence_log_absent_date
+    ON absence_log(absent_date)
+    WHERE is_cancelled = false;
+
+CREATE INDEX IF NOT EXISTS idx_absence_log_student_id  ON absence_log(student_id);
+
+CREATE INDEX IF NOT EXISTS idx_timetable_day_week_group
+    ON timetable(day_of_week, week_type, group_name);
+
+CREATE INDEX IF NOT EXISTS idx_homework_due_date
+    ON homework(due_date)
+    WHERE is_active = true;
+
+CREATE INDEX IF NOT EXISTS idx_homework_subject_due
+    ON homework(subject_id, due_date)
+    WHERE is_active = true;
+
+CREATE INDEX IF NOT EXISTS idx_duty_log_duty_date      ON duty_log(duty_date);
+CREATE INDEX IF NOT EXISTS idx_duty_log_student_id     ON duty_log(student_id);
+
+CREATE INDEX IF NOT EXISTS idx_duty_log_replaced_by_id
+    ON duty_log(replaced_by_id)
+    WHERE replaced_by_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_duty_log_archive_duty_date
+    ON duty_log_archive(duty_date);
+
+CREATE INDEX IF NOT EXISTS idx_duty_log_archive_student_id
+    ON duty_log_archive(student_id);
+
+CREATE INDEX IF NOT EXISTS idx_holidays_dates          ON holidays(start_date, end_date);
+
+-- ─────────── ТРИГЕР ───────────
+
+CREATE OR REPLACE FUNCTION sync_absent_cache()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    UPDATE students
+    SET absent_date = NULL, updated_at = now()
+    WHERE id = OLD.student_id
+      AND absent_date = OLD.absent_date;
+    RETURN OLD;
+  END IF;
+
+  IF NEW.is_cancelled = false THEN
+    UPDATE students
+    SET absent_date = NEW.absent_date, updated_at = now()
+    WHERE id = NEW.student_id;
+  ELSE
+    UPDATE students
+    SET absent_date = NULL, updated_at = now()
+    WHERE id = NEW.student_id
+      AND absent_date = NEW.absent_date;
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_sync_absent_cache ON absence_log;
+
+CREATE TRIGGER trg_sync_absent_cache
+AFTER INSERT OR UPDATE OR DELETE ON absence_log
+FOR EACH ROW EXECUTE FUNCTION sync_absent_cache();
+
+-- ─────────── ПОЧАТКОВІ ДАНІ ───────────
+
+-- Початкова конфігурація класу (змінити перед запуском!)
+INSERT INTO class_info (id, class_number, class_letter, academic_year_start)
+VALUES (1, 7, 'А', '2024-09-01')
+ON CONFLICT (id) DO NOTHING;
+
+-- Початкова конфігурація тижнів (змінити semester_start і first_week_type!)
+INSERT INTO week_config (id, semester_start, first_week_type, is_active)
+VALUES (1, '2025-01-13', 'numerator', true)
+ON CONFLICT (id) DO NOTHING;
+
+-- ─────────── ПРЕДМЕТИ (ПРИКЛАД — замінити на реальні!) ───────────
+
+INSERT INTO subjects (name) VALUES
+    ('Математика'),
+    ('Українська мова'),
+    ('Українська література'),
+    ('Англійська мова'),
+    ('Фізика'),
+    ('Хімія'),
+    ('Біологія'),
+    ('Географія'),
+    ('Історія'),
+    ('Інформатика'),
+    ('Фізкультура'),
+    ('Музика'),
+    ('Образотворче мистецтво'),
+    ('Захист України'),
+    ('Технології')
+ON CONFLICT (name) DO NOTHING;
+```
+
+### 22.2. Виконання міграції
+
+```bash
+# Для Supabase через psql:
+psql "$DATABASE_URL" -f migrations/001_init_db.sql
+
+# Або через Python при старті (dev-режим):
+async def run_migration(pool):
+    with open("migrations/001_init_db.sql") as f:
+        sql = f.read()
+    await pool.execute(sql)
+```
+
+**В production (Render + Supabase):** міграція виконується вручну через SQL-редактор Supabase (п. 23). Автоматичне виконання при старті **не рекомендується** для production через ризик неконтрольованих змін схеми.
+
+---
+
+## 23. Інструкція для адміністратора Supabase
+
+> Файл `SUPABASE_SETUP.md` у корені репозиторію. Нижче наведено повний зміст.
+
+---
+
+### SUPABASE_SETUP.md — Покрокова інструкція
+
+#### Крок 1. Створення проєкту Supabase
+
+1. Зайдіть на [supabase.com](https://supabase.com) → «New Project».
+2. Введіть назву проєкту (наприклад, `classhelperprobot`).
+3. Виберіть регіон, найближчий до України: **Frankfurt (eu-central-1)**.
+4. Встановіть надійний пароль для бази даних (збережіть в менеджері паролів).
+5. Натисніть «Create new project» і дочекайтесь ініціалізації (~2 хвилини).
+
+#### Крок 2. Отримання DATABASE_URL
+
+1. Перейдіть: **Settings → Database**.
+2. У розділі «Connection string» виберіть тип **URI**.
+3. Скопіюйте рядок виду: `postgresql://postgres:[PASSWORD]@db.[REF].supabase.co:5432/postgres`
+4. Замініть `[PASSWORD]` на пароль, встановлений у кроці 1.
+5. Збережіть як змінну `DATABASE_URL` у `.env` і на Render.
+
+#### Крок 3. Виконання міграції
+
+1. Перейдіть: **SQL Editor → New query**.
+2. Відкрийте файл `migrations/001_init_db.sql` з репозиторію.
+3. Скопіюйте весь вміст у SQL Editor.
+4. Натисніть **Run** (або `Ctrl+Enter`).
+5. Переконайтеся, що виконання завершилось без помилок (знизу з'явиться `Success`).
+6. Перейдіть у **Table Editor** і перевірте, що всі таблиці створені: `students`, `absence_log`, `subjects`, `timetable`, `homework`, `duty_log`, `duty_log_archive`, `holidays`, `bot_messages`, `week_config`, `cron_runs`, `class_info`, `failed_jobs`.
+
+#### Крок 4. Налаштування розкладу
+
+1. Перейдіть: **Table Editor → `timetable`**.
+2. Натисніть **Insert row** для кожного уроку.
+3. Значення полів:
+   - `day_of_week`: 0 = Пн, 1 = Вт, 2 = Ср, 3 = Чт, 4 = Пт.
+   - `lesson_num`: номер уроку в розкладі (1, 2, 3...).
+   - `subject_id`: ID предмета з таблиці `subjects`.
+   - `cabinet`: рядок (наприклад, `"310"`) або порожньо.
+   - `teacher`: прізвище та ім'я вчителя або порожньо.
+   - `week_type`: `'numerator'` (чисельник), `'denominator'` (знаменник), або `'both'` (обидва).
+   - `group_name`: `'all'`, `'A'`, або `'B'`.
+
+**Приклад:** математика у вівторок (lesson 1), для всіх, обидва тижні, каб. 204:
+```sql
+INSERT INTO timetable (day_of_week, lesson_num, subject_id, cabinet, week_type, group_name)
+SELECT 1, 1, id, '204', 'both', 'all' FROM subjects WHERE name = 'Математика';
+```
+
+#### Крок 5. Додавання учнів
+
+```sql
+-- Приклад: додати учня без telegram_id (буде прив'язаний пізніше)
+INSERT INTO students (full_name, role, group_name)
+VALUES ('Коваленко Андрій Іванович', 'starosta', 'all');
+
+-- Учень з підгрупою
+INSERT INTO students (full_name, role, group_name)
+VALUES ('Мельник Олена Петрівна', 'student', 'A');
+
+-- Додати telegram_id наявному учню (після того як учень написав /myid)
+UPDATE students SET telegram_id = 123456789 WHERE full_name = 'Коваленко Андрій Іванович';
+```
+
+Або через **Table Editor** → `students` → **Insert row**.
+
+#### Крок 6. Налаштування `class_info` та `week_config`
+
+```sql
+-- Оновити дані класу (якщо потрібно змінити початкові значення)
+UPDATE class_info
+SET class_number = 7,
+    class_letter = 'А',
+    academic_year_start = '2024-09-01'
+WHERE id = 1;
+
+-- Оновити конфігурацію тижнів:
+-- semester_start — перший день першого навчального тижня поточного семестру
+-- first_week_type — тип першого тижня цього семестру
+UPDATE week_config
+SET semester_start = '2025-01-13',
+    first_week_type = 'numerator'
+WHERE id = 1;
+```
+
+**Як визначити `semester_start` і `first_week_type`:**
+
+1. Знайдіть перший навчальний день семестру (перший понеділок тижня, коли почалися заняття).
+2. Визначте, який тип тижня був на той тиждень (запитайте у вчителя або перевірте по шкільному розкладу).
+3. Введіть відповідно.
+
+#### Крок 7. Додавання канікул
+
+```sql
+-- Осінні канікули 2024
+INSERT INTO holidays (start_date, end_date, description)
+VALUES ('2024-10-28', '2024-11-01', 'Осінні канікули');
+
+-- Зимові канікули 2024-2025
+INSERT INTO holidays (start_date, end_date, description)
+VALUES ('2024-12-23', '2025-01-10', 'Зимові канікули');
+
+-- Весняні канікули 2025
+INSERT INTO holidays (start_date, end_date, description)
+VALUES ('2025-03-24', '2025-03-28', 'Весняні канікули');
+```
+
+#### Крок 8. Перевірка конфігурації
+
+Виконайте наступні запити для перевірки:
+
+```sql
+-- Перевірити клас та тижневу конфігурацію
+SELECT * FROM class_info;
+SELECT * FROM week_config;
+
+-- Перевірити кількість учнів
+SELECT COUNT(*) AS total, COUNT(telegram_id) AS linked FROM students WHERE is_active = true;
+
+-- Перевірити розклад (кількість уроків по днях)
+SELECT day_of_week, COUNT(*) FROM timetable GROUP BY day_of_week ORDER BY day_of_week;
+
+-- Перевірити предмети
+SELECT id, name FROM subjects ORDER BY name;
+
+-- Перевірити канікули
+SELECT * FROM holidays ORDER BY start_date;
+```
+
+#### Крок 9. Автоматичні бекапи
+
+1. Перейдіть: **Settings → Backups**.
+2. На платних планах (Pro+) бекапи вмикаються автоматично (щоденно, 7-30 днів).
+3. На безкоштовному плані — **ручні бекапи** через `pg_dump`:
+
+```bash
+pg_dump "$DATABASE_URL" --no-owner --no-privileges > backup_$(date +%Y%m%d).sql
+```
+
+Виконуйте щотижня і зберігайте в безпечному місці.
+
+#### Крок 10. Налаштування cron-job.org
+
+Створіть **7 завдань** у cron-job.org (часовий пояс **Europe/Kyiv** для всіх):
+
+| Назва | URL | Час | HTTP заголовок |
+|---|---|---|---|
+| Keep-alive | `https://YOUR_APP.onrender.com/ping` | `*/10 * * * *` | — |
+| Evening wake | `https://YOUR_APP.onrender.com/ping` | `58 19 * * 1-5` | — |
+| Evening cron | `https://YOUR_APP.onrender.com/cron/evening` | `0 20 * * 1-5` | `X-Cron-Token: <TOKEN>` |
+| Morning wake | `https://YOUR_APP.onrender.com/ping` | `43 9 * * 1-5` | — |
+| Morning cron | `https://YOUR_APP.onrender.com/cron/morning` | `45 9 * * 1-5` | `X-Cron-Token: <TOKEN>` |
+| Sept wake | `https://YOUR_APP.onrender.com/ping` | `3 0 1 9 *` | — |
+| Sept reset | `https://YOUR_APP.onrender.com/cron/reset_academic_year` | `5 0 1 9 *` | `X-Cron-Token: <TOKEN>` |
+
+> **Примітка:** `<TOKEN>` = значення `CRON_SECRET_TOKEN` з ваших змінних оточення. Введіть через розділ «Headers» в cron-job.org.
+
+#### Крок 11. Перевірка роботи бота
+
+1. Напишіть боту `/myid` — отримаєте свій Telegram ID.
+2. Додайте свій ID у `students` (або встановіть через адмін-панель).
+3. Напишіть `/start` — побачите головне меню.
+4. Перевірте розклад, ДЗ, чергування.
+5. Для тестування cron — викличте вручну через браузер (з додаванням заголовку) або тимчасово спростіть токен.
+
+---
+
+## 24. Додаткові вимоги
+
+### 24.1. Поведінка при недоступності Redis
+
+Якщо Redis недоступний після 3 спроб підключення з backoff (0.1, 0.2, 0.4 с), система переходить у **деградований режим**. Надсилається повідомлення адмінам: *«⚠️ Redis недоступний. Бот перейшов у деградований режим.»*
+
+| Функція | Поведінка в деградованому режимі |
+|---|---|
+| FSM | Відповідь: *«❌ Тимчасова технічна помилка. Спробуйте ще раз.»* Стан не зберігається. |
+| Ідемпотентність webhook | Логувати `WARNING`, не блокувати обробку (ризик дубліката прийнятний). |
+| Callback idempotency | Логувати `WARNING`, пропускати перевірку. |
+| Cron locks | Використовувати тільки перевірку через `cron_runs` у БД (достатньо за умов нечастих cron). |
+| Кеш розкладу | Звертатися до БД напряму. |
+| Rate limiting | Пропускати перевірку throttle. |
+| Кеш учня (auth) | Завантажувати з БД при кожному запиті. |
+
+### 24.2. Redis — повний перелік ключів
+
+| Ключ | TTL | Призначення |
+|---|---|---|
+| `processed_update:{update_id}` | 86400 с (24 год) | Ідемпотентність webhook |
+| `callback_processed:{callback_id}` | 60 с | Захист від подвійного кліку |
+| `start_notify:{user_id}` | 600 с (10 хв) | Throttle сповіщень при /start |
+| `cron_lock:{endpoint}:{run_date}` | 30 с | Захист від паралельного виконання cron |
+| `timetable:{date}:{group}:{week_type}` | 300 с (5 хв) | Кеш розкладу |
+| `throttle:{user_id}` | 3 с | Rate limiting повідомлень |
+| `student_cache:{telegram_id}` | 60 с | Кеш запису учня (auth middleware) |
+| FSM state keys (aiogram) | 300 с (5 хв) | Стани FSM (`state_ttl=300`) |
+| FSM data keys (aiogram) | 300 с (5 хв) | Дані FSM (`data_ttl=300`) |
+
+### 24.3. Версіонування розкладу
+
+Версіонування розкладу не реалізується. При зміні `timetable` (додавання/видалення уроків) попередній стан не зберігається. `homework` залишаються прив'язаними до `subject_id` — якщо назву предмету змінено в `subjects`, ДЗ відображатиметься з новою назвою. Це прийнятний компроміс для шкільного бота.
+
+### 24.4. Бекапи
+
+- **Supabase:** автоматичні щоденні бекапи (на платному плані). На безкоштовному — ручні (п. 23, Крок 9).
+- **Опціонально (не MVP):** щотижневий cron у понеділок о 03:00 створює дамп `students`, `duty_log`, `homework` у CSV і зберігає локально або надсилає на email адміна.
+
+### 24.5. Інваліданція кешу учня
+
+При зміні будь-якого поля запису `students` через адмінку (роль, підгрупа, telegram_id, is_active) — видаляти Redis-ключ `student_cache:{telegram_id}`, щоб auth middleware отримав оновлені дані при наступному запиті.
+
+---
+
+## 25. Тестування
+
+### 25.1. Файл `requirements-dev.txt`
+
+```
+pytest==8.2.0
+pytest-asyncio==0.23.7
+pytest-mock==3.14.0
+```
+
+### 25.2. Конфігурація pytest (`pytest.ini` або `pyproject.toml`)
+
+```ini
+[pytest]
+asyncio_mode = auto
+testpaths = tests
+```
+
+### 25.3. Обов'язкові юніт-тести
+
+| Файл | Що перевіряє |
+|---|---|
+| `test_week_type.py` | `get_week_type`: коректне чергування numerator/denominator; від'ємні дати до semester_start; дати рівно на межі тижня |
+| `test_duty_algorithm.py` | Сортування за `consecutive_duty_skip` та `last_duty_date`; cooldown; fallback без cooldown; fallback при 0 кандидатах; коректне виключення вже вибраних у спробі 2 |
+| `test_is_school_day.py` | Субота і неділя → `(False, 'weekend')`; дата в holidays → `(False, 'holiday')`; звичайний робочий день → `(True, '')`; канікули на кілька діб |
+| `test_cron_idempotency.py` | Подвійний виклик повертає `skipped`; Redis Lock працює (mock); cron_runs перевірка; поведінка при недоступному Redis |
+
+### 25.4. Приклад тесту `test_week_type.py`
+
+```python
+import pytest
+from datetime import date
+from services.schedule import get_week_type
+
+@pytest.mark.parametrize("target, start, first_type, expected", [
+    # Перший тиждень → перший тип
+    (date(2025, 1, 13), date(2025, 1, 13), 'numerator', 'numerator'),
+    # Другий тиждень → другий тип
+    (date(2025, 1, 20), date(2025, 1, 13), 'numerator', 'denominator'),
+    # Третій тиждень → знов перший
+    (date(2025, 1, 27), date(2025, 1, 13), 'numerator', 'numerator'),
+    # Перший тип = denominator
+    (date(2025, 1, 13), date(2025, 1, 13), 'denominator', 'denominator'),
+    (date(2025, 1, 20), date(2025, 1, 13), 'denominator', 'numerator'),
+    # Дата в середині тижня — той самий тиждень
+    (date(2025, 1, 15), date(2025, 1, 13), 'numerator', 'numerator'),
+    (date(2025, 1, 16), date(2025, 1, 13), 'numerator', 'numerator'),
+    # Дата до semester_start (від'ємний тиждень)
+    (date(2025, 1, 6), date(2025, 1, 13), 'numerator', 'denominator'),
+])
+def test_get_week_type(target, start, first_type, expected):
+    assert get_week_type(target, start, first_type) == expected
+```
+
+### 25.5. Команда для запуску
+
+```bash
+python -m pytest tests/ -v --tb=short
+```
+
+---
+
+## 26. Definition of Done
+
+Система вважається готовою до експлуатації, якщо виконані **всі** наступні умови:
+
+- ✅ Webhook приймає оновлення стабільно; дублікати обробляються (ідемпотентність через Redis).
+- ✅ Cron-завдання виконуються без дублювання (Redis Lock + `cron_runs`).
+- ✅ Відсутні race conditions у логіці призначення чергових (транзакції `REPEATABLE READ` + `FOR UPDATE`).
+- ✅ Всі операції, що змінюють стан БД, атомарні (явні транзакції).
+- ✅ FSM стійкий до таймаутів (`state_ttl=300`); не залишає «завислих» станів.
+- ✅ При недоступності Redis система продовжує виконувати критичні функції згідно з п. 24.1.
+- ✅ Telegram rate limits (`TelegramRetryAfter`) коректно обробляються; повідомлення не губляться.
+- ✅ Відсутнє дублювання повідомлень у груповий чат (вечірнє повідомлення редагується, нове надсилається тільки при помилці редагування).
+- ✅ Адміністративні дії вимагають підтвердження перед виконанням.
+- ✅ Логування достатнє для діагностики; критичні помилки записуються в `failed_jobs`.
+- ✅ Усі юніт-тести (п. 25) проходять успішно (`pytest tests/ -v`).
+- ✅ Graceful shutdown коректно завершує всі ресурси (БД, Redis, черга).
+- ✅ Webhook встановлюється з `delete_webhook` → `set_webhook` при кожному старті.
+- ✅ Команди бота зареєстровані через `set_my_commands`.
+- ✅ `students.absent_date` оновлюється **виключно** через тригер `trg_sync_absent_cache`, а не вручну.
+- ✅ Кеш розкладу інвалідується через cursor-based `SCAN` (не блокуючий).
+- ✅ `duty_log_archive` використовує явні колонки без FK-обмежень.
+- ✅ Sentry ініціалізується при старті (якщо `SENTRY_DSN` вказано).
+- ✅ `zoneinfo` не встановлюється як окремий пакет (вбудовано в Python 3.10+).
+
+---
+
+*Кінець Технічного завдання. Версія 9.0.*
