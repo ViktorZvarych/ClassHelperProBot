@@ -1,9 +1,19 @@
+# Змінні оточення
 .env
+
+# Python
 *.pyc
 __pycache__/
+venv/
+
+# Логи
 logs/
 *.log
+
+# IDE
 .idea/
 .vscode/
+
+# Бази даних
 *.db
 *.sqlite3
