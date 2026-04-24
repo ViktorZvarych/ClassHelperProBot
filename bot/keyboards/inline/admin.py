@@ -42,3 +42,34 @@ def absence_students_keyboard(students, statuses):
     buttons.append([InlineKeyboardButton(text="✅ Зберегти зміни", callback_data="absence_save")])
     buttons.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_back")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def back_to_admin_btn():
+    """Кнопка повернення до адмін-панелі."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="↩️ Назад до адмін-панелі", callback_data="admin_back")]
+    ])
+    
+def role_keyboard():
+    """Клавіатура вибору ролі учня."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Учень", callback_data="role_student")],
+        [InlineKeyboardButton(text="📎 Заст. старости", callback_data="role_zamstarosta")],
+        [InlineKeyboardButton(text="✏️ Редактор", callback_data="role_redactor")],
+        [InlineKeyboardButton(text="🎓 Староста", callback_data="role_starosta")],
+        [InlineKeyboardButton(text="↩️ Назад", callback_data="admin_back")]
+    ])
+
+def group_keyboard():
+    """Клавіатура вибору підгрупи."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🅰️ Група A", callback_data="group_A")],
+        [InlineKeyboardButton(text="🅱️ Група B", callback_data="group_B")],
+        [InlineKeyboardButton(text="👥 Без підгрупи", callback_data="group_all")],
+        [InlineKeyboardButton(text="↩️ Назад", callback_data="admin_back")]
+    ])
+    
+def confirm_cancel_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Підтвердити", callback_data="confirm_yes"),
+         InlineKeyboardButton(text="❌ Скасувати", callback_data="confirm_no")]
+    ])

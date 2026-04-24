@@ -9,7 +9,8 @@ class DatabaseMiddleware(BaseMiddleware):
         event: Update,
         data: Dict[str, Any],
     ) -> Any:
-        pool = data["dp"]["db_pool"]
+        # Тепер беремо db_pool напряму з data
+        pool = data["db_pool"]
         async with pool.acquire() as conn:
             data["db"] = conn
             return await handler(event, data)

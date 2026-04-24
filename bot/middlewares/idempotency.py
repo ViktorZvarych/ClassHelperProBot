@@ -1,6 +1,4 @@
- # Ідемпотентність update та callback
- 
- import logging
+import logging
 from aiogram import BaseMiddleware
 from aiogram.types import Update, CallbackQuery
 from typing import Any, Awaitable, Callable, Dict
