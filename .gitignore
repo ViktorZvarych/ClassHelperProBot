@@ -17,3 +17,4 @@ logs/
 # Бази даних
 *.db
 *.sqlite3
+SUPABASE_DB_SQL_TEMPLATES.md

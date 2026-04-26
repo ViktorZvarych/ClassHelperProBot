@@ -4,7 +4,7 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 def get_main_menu_keyboard(is_super_admin: bool = False) -> ReplyKeyboardMarkup:
     buttons = [
-        [KeyboardButton(text="📅 Розклад сьогодні"), KeyboardButton(text="📆 Розклад завтра")],
+        [KeyboardButton(text="📅 Розклад сьогодні"), KeyboardButton(text="📆 Розклад на 3 дні")],
         [KeyboardButton(text="📚 Домашнє завдання"), KeyboardButton(text="🧹 Чергування")],
         [KeyboardButton(text="👥 Список учнів"), KeyboardButton(text="📋 Відсутні за 5 днів")],
     ]

@@ -44,3 +44,9 @@ class ConfirmDuty(StatesGroup):
 
 class GetHomeworkByDate(StatesGroup):
     waiting_date = State()
+    
+class AddHomework(StatesGroup):
+    waiting_subject = State()
+    waiting_text = State()
+    waiting_is_control = State()
+    waiting_confirm = State()

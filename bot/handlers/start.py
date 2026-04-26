@@ -3,7 +3,7 @@
 import html
 import logging
 from aiogram import Router, F
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from db.queries.students import get_student_by_telegram_id
@@ -47,3 +47,12 @@ async def cmd_myid(message: Message):
         f"🆔 Ваш Telegram ID: {message.from_user.id}\n"
         f"Скопіюйте його та передайте адміністратору для реєстрації в системі."
     )
+    
+@router.callback_query(F.data == "back_to_main")
+async def back_to_main(callback: CallbackQuery, student):
+    # Надсилаємо нове повідомлення з reply-клавіатурою
+    await callback.message.answer(
+        f"👋 Вітаємо, {html.escape(student['full_name'])}!\nОберіть дію з меню нижче.",
+        reply_markup=get_main_menu_keyboard(is_super_admin=(callback.from_user.id in settings.super_admin_ids_set))
+    )
+    await callback.answer()

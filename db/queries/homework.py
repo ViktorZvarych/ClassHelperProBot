@@ -1,11 +1,30 @@
 async def get_homework_for_subjects(subject_ids, due_date, conn):
-    rows = await conn.fetch("""
+    if not subject_ids:
+        return {}
+    rows = await conn.fetch(
+        """
         SELECT subject_id, description, is_control
         FROM homework
-        WHERE subject_id = ANY($1::int[]) AND due_date = $2 AND is_active = true
-        ORDER BY created_at DESC
-    """, subject_ids, due_date)
-    return {r["subject_id"]: dict(r) for r in rows}
+        WHERE subject_id = ANY($1::int[]) 
+          AND due_date = $2 
+          AND is_active = true
+        ORDER BY created_at ASC
+        """,
+        subject_ids,
+        due_date
+    )
+    # Групуємо за subject_id, об'єднуємо описи
+    result = {}
+    for r in rows:
+        sid = r["subject_id"]
+        if sid not in result:
+            result[sid] = {"description": r["description"], "is_control": r["is_control"]}
+        else:
+            # Об'єднуємо з попереднім
+            result[sid]["description"] += " | " + r["description"]
+            # Якщо хоча б одне завдання контрольне — позначаємо
+            result[sid]["is_control"] = result[sid]["is_control"] or r["is_control"]
+    return result
 
 async def add_homework(conn, subject_id, due_date, description, is_control, added_by):
     await conn.execute("""

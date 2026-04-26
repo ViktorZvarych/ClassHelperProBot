@@ -35,12 +35,34 @@ def holidays_management_keyboard():
 
 def absence_students_keyboard(students, statuses):
     buttons = []
+    row = []
     for s in students:
         absent = statuses.get(s["id"], False)
         emoji = "❌" if absent else "✅"
-        buttons.append([InlineKeyboardButton(text=f"{emoji} {s['full_name']}", callback_data=f"toggle_absence_{s['id']}")])
-    buttons.append([InlineKeyboardButton(text="✅ Зберегти зміни", callback_data="absence_save")])
-    buttons.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_back")])
+        # Коротке ім'я (прізвище + перша літера імені)
+        name_parts = s["full_name"].split()
+        if len(name_parts) >= 2:
+            short_name = f"{name_parts[0]} {name_parts[1][0]}."
+        else:
+            short_name = s["full_name"]
+        
+        row.append(InlineKeyboardButton(
+            text=f"{emoji} {short_name}",
+            callback_data=f"toggle_absence_{s['id']}"
+        ))
+        
+        # По дві кнопки в рядок
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    
+    # Додаємо останню кнопку, якщо вона одна в рядку
+    if row:
+        buttons.append(row)
+    
+    # Кнопка "Назад"
+    buttons.append([InlineKeyboardButton(text="↩️ Назад", callback_data="absence_back")])
+    
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def back_to_admin_btn():

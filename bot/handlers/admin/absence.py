@@ -1,12 +1,9 @@
-# Відмітка відсутніх
-
 import html
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from aiogram import Router, F
-from aiogram.types import CallbackQuery
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
-from bot.keyboards.inline.admin import absence_students_keyboard, confirm_cancel_keyboard
 from db.queries.absence import get_absence_status_today, mark_absent, mark_present
 from db.queries.students import get_all_active_students
 from config import settings
@@ -22,20 +19,48 @@ async def absence_today(callback: CallbackQuery, db):
     warning = ""
     if now.hour >= 9 and now.minute >= 40:
         warning = "⚠️ Зараз після 09:40. Зміни не вплинуть на чергування сьогодні.\n\n"
-    text = warning + "Відмітка відсутніх сьогодні:\n"
-    await callback.message.edit_text(text, reply_markup=absence_students_keyboard(students, statuses))
+    text = warning + "🩺 Відмітка відсутніх сьогодні:\n\n<i>Натискайте на учня, щоб змінити статус</i>"
+    await callback.message.edit_text(
+        text,
+        reply_markup=absence_students_keyboard(students, statuses),
+        parse_mode="HTML"
+    )
     await callback.answer()
 
 @router.callback_query(F.data.startswith("toggle_absence_"))
-async def toggle_absence(callback: CallbackQuery, db, redis):
-    # Логіка перемикання стану через callback_data
-    # Зберігаємо зміни в FSM або Redis до фінального підтвердження
-    await callback.answer("Стан змінено (тимчасово)")
+async def toggle_absence(callback: CallbackQuery, db):
+    student_id = int(callback.data.split("_")[2])
+    
+    # Отримуємо поточний статус
+    statuses = await get_absence_status_today(db)
+    is_absent_now = statuses.get(student_id, False)
+    
+    # Інвертуємо: якщо був присутній → відмічаємо як відсутнього, і навпаки
+    from datetime import date
+    today = date.today()
+    
+    if is_absent_now:
+        # Був відсутній → робимо присутнім
+        await mark_present(db, student_id, today)
+    else:
+        # Був присутній → відмічаємо як відсутнього
+        await mark_absent(db, student_id, today)
+    
+    # Отримуємо оновлені статуси
+    students = await get_all_active_students(db)
+    updated_statuses = await get_absence_status_today(db)
+    
     # Оновлюємо клавіатуру
-    # ...
+    await callback.message.edit_reply_markup(
+        reply_markup=absence_students_keyboard(students, updated_statuses)
+    )
+    await callback.answer("✅ Статус оновлено!")
 
-@router.callback_query(F.data == "absence_save")
-async def absence_save(callback: CallbackQuery, state: FSMContext, db):
-    # Збереження змін з транзакцією та оптимістичним блокуванням
-    await callback.message.edit_text("✅ Відмітку збережено.")
+@router.callback_query(F.data == "absence_back")
+async def absence_back(callback: CallbackQuery):
+    from bot.keyboards.inline.admin import admin_panel_keyboard
+    await callback.message.edit_text(
+        "Адміністративна панель:",
+        reply_markup=admin_panel_keyboard()
+    )
     await callback.answer()
