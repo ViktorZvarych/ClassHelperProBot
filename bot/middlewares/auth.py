@@ -1,10 +1,9 @@
-# Перевірка ролі та реєстрації
-
+import json
 import logging
 from aiogram import BaseMiddleware
-from aiogram.types import Update, Message, CallbackQuery
+from aiogram.types import Update
 from typing import Any, Awaitable, Callable, Dict
-from db.queries.students import get_student_by_telegram_id
+from db.queries.students import get_student_with_class_name
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -27,20 +26,18 @@ class AuthMiddleware(BaseMiddleware):
 
         data["is_super_admin"] = user_id in settings.super_admin_ids_set
 
-        # Try cache
         student = None
         if redis:
             cache_key = f"student_cache:{user_id}"
             cached = await redis.get(cache_key)
             if cached:
-                import json
                 student = json.loads(cached)
             else:
-                student = await get_student_by_telegram_id(data["db"], user_id)
+                student = await get_student_with_class_name(data["db"], user_id)
                 if student:
-                    await redis.setex(cache_key, 60, json.dumps(dict(student)))
+                    await redis.setex(cache_key, 60, json.dumps(student, default=str))
         else:
-            student = await get_student_by_telegram_id(data["db"], user_id)
+            student = await get_student_with_class_name(data["db"], user_id)
 
         data["student"] = student
         return await handler(event, data)

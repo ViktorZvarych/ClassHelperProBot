@@ -29,7 +29,7 @@ async def list_students(message: Message, db, student, is_super_admin):
     text += f"\nВсього учнів: {len(students)}"
     await message.answer(text)
     # Додати кнопку розсилки для уповноважених
-    if is_super_admin or student and student["role"] in ("starosta", "redactor"):
+    if is_super_admin or student and student["role"] in ("starosta", "guest"):
         from bot.keyboards.inline.common import broadcast_button
         await message.answer("✉️", reply_markup=broadcast_button())
 

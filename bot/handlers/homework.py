@@ -3,42 +3,29 @@ from datetime import date, datetime, timedelta
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
-from aiogram.filters import StateFilter
 from zoneinfo import ZoneInfo
 from config import settings
-from bot.keyboards.inline.homework import homework_menu_keyboard
-from bot.keyboards.inline.common import cancel_button
-from bot.states.fsm import GetHomeworkByDate
 from services.schedule import is_school_day, get_timetable_for_date, get_week_type, format_date_uk, parse_date_input
 from db.queries.schedule import get_week_config
 from db.queries.homework import get_homework_for_subjects
-from db.queries.subjects import get_all_subjects
 
 router = Router()
 
-@router.message(F.text == "📚 Домашнє завдання")
-async def homework_menu(message: Message):
-    await message.answer("Оберіть період:", reply_markup=homework_menu_keyboard())
+# ============ КНОПКИ З ГОЛОВНОГО МЕНЮ ============
 
-# ============ НА СЬОГОДНІ ============
-
-@router.callback_query(F.data == "hw_today")
-async def hw_today(callback: CallbackQuery, db, redis, student):
+@router.message(F.text == "📖 ДЗ на сьогодні")
+async def hw_today_main(message: Message, db, redis, student):
     tz = ZoneInfo(settings.TIMEZONE)
     target = datetime.now(tz).date()
-    await show_homework(callback.message, target, db, redis, student, is_first=True)
-    await callback.answer()
+    await show_homework(message, target, db, redis, student, is_first=True)
 
-# ============ НА 3 ДНІ (завтра + 2) ============
-
-@router.callback_query(F.data == "hw_3_days")
-async def hw_3_days(callback: CallbackQuery, db, redis, student):
+@router.message(F.text == "📚 ДЗ на 3 дні")
+async def hw_3_days_main(message: Message, db, redis, student):
     tz = ZoneInfo(settings.TIMEZONE)
     tomorrow = datetime.now(tz).date() + timedelta(days=1)
     for offset in range(3):
         target = tomorrow + timedelta(days=offset)
-        await show_homework(callback.message, target, db, redis, student, is_first=(offset == 0))
-    await callback.answer()
+        await show_homework(message, target, db, redis, student, is_first=(offset == 0))
 
 # ============ ОСНОВНА ФУНКЦІЯ ПОКАЗУ ДЗ ============
 
@@ -46,7 +33,7 @@ async def show_homework(msg: Message, target_date: date, db, redis, student, is_
     school_day, reason = await is_school_day(target_date, db)
     if not school_day:
         reason_text = "вихідний" if reason == "weekend" else "канікули"
-        day_label = "Завтра" if is_first else format_date_uk(target_date)
+        day_label = "Сьогодні" if is_first else "Завтра" if is_first else format_date_uk(target_date)
         await msg.answer(f"📭 {day_label} — {reason_text}, уроків немає.")
         return
 
@@ -59,7 +46,7 @@ async def show_homework(msg: Message, target_date: date, db, redis, student, is_
     lessons = await get_timetable_for_date(target_date, student["group_name"], week_type, db, redis)
 
     if not lessons:
-        day_label = "Завтра" if is_first else format_date_uk(target_date)
+        day_label = "Сьогодні" if is_first else format_date_uk(target_date)
         await msg.answer(f"📭 Розклад на {day_label} порожній, ДЗ відсутнє.")
         return
 
@@ -69,7 +56,7 @@ async def show_homework(msg: Message, target_date: date, db, redis, student, is_
     # Формуємо заголовок
     date_str = format_date_uk(target_date)
     if is_first:
-        header = f"📚 Домашнє завдання на Завтра, {date_str}:"
+        header = f"📚 Домашнє завдання на Сьогодні, {date_str}:"
     else:
         header = f"📚 Домашнє завдання на {date_str}:"
 

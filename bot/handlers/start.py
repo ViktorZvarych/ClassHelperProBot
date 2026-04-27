@@ -1,5 +1,3 @@
-# /start, /myid
-
 import html
 import logging
 from aiogram import Router, F
@@ -19,9 +17,17 @@ async def cmd_start(message: Message, state: FSMContext, db, redis, student=None
     await state.clear()
     user_id = message.from_user.id
     if student:
+        role = student.get('role', 'student')
+        class_text = f" учням {html.escape(student.get('class_name', ''))} класу" if student.get('class_name') else ""
+        
         await message.answer(
-            f"👋 Вітаємо, {html.escape(student['full_name'])}!\nОберіть дію з меню нижче.",
-            reply_markup=get_main_menu_keyboard(is_super_admin=(user_id in settings.super_admin_ids_set))
+            f"👋 Вітаємо, {html.escape(student['full_name'])}!\n"
+            f"Я ClassHelperProBot. Моя місія — допомога{class_text}.\n"
+            f"Оберіть дію з меню нижче.",
+            reply_markup=get_main_menu_keyboard(
+                is_super_admin=(user_id in settings.super_admin_ids_set),
+                role=role
+            )
         )
     else:
         await message.answer(
@@ -30,7 +36,6 @@ async def cmd_start(message: Message, state: FSMContext, db, redis, student=None
             f"Ваш Telegram ID: {user_id}\n"
             f"(скопіюйте та передайте адміністратору)"
         )
-        # Notify admins with throttle
         await notify_admins_throttled(
             redis, user_id,
             f"🔔 Новий користувач намагався запустити бота:\n"
@@ -47,12 +52,23 @@ async def cmd_myid(message: Message):
         f"🆔 Ваш Telegram ID: {message.from_user.id}\n"
         f"Скопіюйте його та передайте адміністратору для реєстрації в системі."
     )
-    
+
 @router.callback_query(F.data == "back_to_main")
 async def back_to_main(callback: CallbackQuery, student):
-    # Надсилаємо нове повідомлення з reply-клавіатурою
+    if not student:
+        await callback.answer("Спочатку зареєструйтесь через /start.", show_alert=True)
+        return
+    role = student.get('role', 'student')
+    user_id = callback.from_user.id
+    class_text = f" учням {html.escape(student.get('class_name', ''))} класу" if student.get('class_name') else ""
+    
     await callback.message.answer(
-        f"👋 Вітаємо, {html.escape(student['full_name'])}!\nОберіть дію з меню нижче.",
-        reply_markup=get_main_menu_keyboard(is_super_admin=(callback.from_user.id in settings.super_admin_ids_set))
+        f"👋 Вітаємо, {html.escape(student['full_name'])}!\n"
+        f"Я ClassHelperProBot. Моя місія — допомога{class_text}.\n"
+        f"Оберіть дію з меню нижче.",
+        reply_markup=get_main_menu_keyboard(
+            is_super_admin=(user_id in settings.super_admin_ids_set),
+            role=role
+        )
     )
     await callback.answer()

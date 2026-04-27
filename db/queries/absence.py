@@ -17,8 +17,10 @@ async def mark_present(conn, student_id, absent_date):
 async def get_absence_status_today(conn):
     today = date.today()
     rows = await conn.fetch("""
-        SELECT student_id, is_cancelled FROM absence_log
-        WHERE absent_date = $1
+        SELECT al.student_id, al.is_cancelled
+        FROM absence_log al
+        JOIN students s ON al.student_id = s.id
+        WHERE al.absent_date = $1 AND s.role != 'guest'
     """, today)
     return {r["student_id"]: not r["is_cancelled"] for r in rows}
 
@@ -29,7 +31,9 @@ async def get_absence_last_5_days(conn):
         SELECT al.absent_date, s.full_name
         FROM absence_log al
         JOIN students s ON al.student_id = s.id
-        WHERE al.absent_date BETWEEN $1 AND $2 AND al.is_cancelled = false
+        WHERE al.absent_date BETWEEN $1 AND $2
+          AND al.is_cancelled = false
+          AND s.role != 'guest'
         ORDER BY al.absent_date DESC, s.full_name
     """, start, end)
     result = {}
