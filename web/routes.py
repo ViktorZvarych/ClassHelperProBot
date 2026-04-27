@@ -1,5 +1,3 @@
-# Хендлери ендпоінтів (webhook, ping, cron/*)
-
 from aiohttp import web
 import logging
 from config import settings
@@ -7,7 +5,7 @@ from cron.evening import run_evening_cron
 from cron.morning import run_morning_cron
 from cron.reset_year import run_reset_academic_year
 from cron.base import acquire_cron_lock, release_cron_lock, mark_cron_run
-from bot.instance import dp, bot
+from bot.instance import bot
 from aiogram.types import Update
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -23,7 +21,7 @@ async def webhook_handler(request):
     try:
         data = await request.json()
         update = Update.model_validate(data)
-        dp = request.app["dp"]  # <-- беремо з app
+        dp = request.app["dp"]  # беремо dp з app
         await dp.feed_update(bot, update)
     except Exception as e:
         logger.exception("Webhook error")
