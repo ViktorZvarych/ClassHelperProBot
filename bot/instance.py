@@ -6,4 +6,5 @@ from aiogram.enums import ParseMode
 from config import settings
 
 bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+#dp = Dispatcher()
+# dp більше не створюємо тут — він створюється в main.py

@@ -23,6 +23,7 @@ async def webhook_handler(request):
     try:
         data = await request.json()
         update = Update.model_validate(data)
+        dp = request.app["dp"]  # <-- беремо з app
         await dp.feed_update(bot, update)
     except Exception as e:
         logger.exception("Webhook error")

@@ -1,7 +1,6 @@
-# Точка входу: startup, реєстрація роутерів, запуск aiohttp
-
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from aiohttp import web
 from aiogram import Bot, Dispatcher
@@ -14,14 +13,12 @@ import sentry_sdk
 
 from config import settings
 from db.pool import create_db_pool, close_db_pool
-from bot.instance import bot, dp
+from bot.instance import bot
 from bot.middlewares import setup_middlewares
 from bot.handlers import setup_routers
 from web.app import create_app
 from services.broadcast_queue import broadcast_queue, start_broadcast_workers, stop_broadcast_workers
 from services.notifications import notify_admins
-
-import os
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,7 +35,6 @@ if settings.SENTRY_DSN:
     )
 
 async def on_startup(app: web.Application):
-    # Перевірка змінних оточення (вже зроблено в Settings)
     # PostgreSQL
     try:
         app["db_pool"] = await create_db_pool()
@@ -74,12 +70,14 @@ async def on_startup(app: web.Application):
         state_ttl=300,
         data_ttl=300,
     )
-    dp.storage = storage
+
+    # Створюємо Dispatcher зі storage
+    dp = Dispatcher(storage=storage)
     dp["db_pool"] = app["db_pool"]
     dp["redis"] = redis
+    app["dp"] = dp
 
     # Middlewares & Routers
-    dp["bot"] = bot
     setup_middlewares(dp)
     setup_routers(dp)
 
@@ -102,14 +100,9 @@ async def on_startup(app: web.Application):
 
 async def on_cleanup(app: web.Application):
     logger.info("Graceful shutdown started")
-    # Stop broadcast workers
     await stop_broadcast_workers(app["broadcast_workers"], broadcast_queue)
-    # Close DB pool
     await close_db_pool(app["db_pool"])
-    # Close Redis
     await app["redis"].aclose()
-    # Delete webhook (optional)
-    # await bot.delete_webhook()
     logger.info("Graceful shutdown completed")
 
 def main():
@@ -118,7 +111,6 @@ def main():
     app.on_cleanup.append(on_cleanup)
     port = int(os.environ.get("PORT", 8000))
     web.run_app(app, host="0.0.0.0", port=port)
-    app["bot"] = bot
 
 if __name__ == "__main__":
     main()
