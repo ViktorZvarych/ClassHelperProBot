@@ -5,6 +5,7 @@ def get_main_menu_keyboard(is_super_admin: bool = False, role: str = 'student') 
         [KeyboardButton(text="📅 Розклад сьогодні"), KeyboardButton(text="📆 Розклад на 3 дні")],
         [KeyboardButton(text="📖 ДЗ на сьогодні"), KeyboardButton(text="📚 ДЗ на 3 дні")],
         [KeyboardButton(text="🧹 Чергування"), KeyboardButton(text="👥 Список учнів")],
+        [KeyboardButton(text="🗳️ Вибори"), KeyboardButton(text="📖 Інструкція")],
     ]
     if is_super_admin:
         buttons.append([KeyboardButton(text="⚙️ Адмін-панель")])

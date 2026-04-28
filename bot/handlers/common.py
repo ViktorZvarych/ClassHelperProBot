@@ -13,6 +13,7 @@ router = Router()
 
 @router.message(F.text == "👥 Список учнів")
 async def list_students(message: Message, db, student, is_super_admin):
+    
     students = await get_students_list_with_debt(db)
     if not students:
         await message.answer("Список учнів порожній.")
@@ -46,6 +47,23 @@ async def absent_last_5_days(message: Message, db):
         else:
             text += f"🔹 {day_str}: немає\n"
     await message.answer(text)
+    
+@router.message(F.text == "📖 Інструкція")
+async def show_instructions(message: Message):
+    text = (
+        "📖 <b>Головне меню бота</b>\n\n"
+        "• <b>📅 Розклад сьогодні</b> — уроки на поточний день\n"
+        "• <b>📆 Розклад на 3 дні</b> — уроки на завтра + 2 дні\n"
+        "• <b>📖 ДЗ на сьогодні</b> — домашнє завдання на сьогодні\n"
+        "• <b>📚 ДЗ на 3 дні</b> — ДЗ на завтра, післязавтра і післяпіслязавтра\n"
+        "• <b>🧹 Чергування</b> — список чергових, історія, відмітка виконання\n"
+        "• <b>👥 Список учнів</b> — список класу, ролі, борги (староста може розсилати повідомлення)\n"
+        "• <b>🗳️ Вибори</b> — інформація про актив класу, вотум недовіри, складання повноважень\n"
+        "• <b>📖 Інструкція</b> — цей опис\n"
+        "• <b>⚙️ Адмін-панель</b> (тільки для адміністраторів) — керування даними учнів, ДЗ, канікулами, виборами\n\n"
+        "Для початку роботи натисніть /start"
+    )
+    await message.answer(text, parse_mode="HTML")
 
 @router.message()
 async def unknown_message(message: Message, state: FSMContext, student):

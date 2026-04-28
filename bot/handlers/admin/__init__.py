@@ -1,1 +1,1 @@
-from . import panel, absence, homework, students, holidays, class_info
+from . import panel, absence, homework, students, holidays, class_info, instruction

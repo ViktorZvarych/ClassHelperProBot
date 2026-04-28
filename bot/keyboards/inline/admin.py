@@ -9,7 +9,8 @@ def admin_panel_keyboard():
         [InlineKeyboardButton(text="🔄 Скинути борги чергувань", callback_data="admin_reset_skip")],
         [InlineKeyboardButton(text="🗓 Канікули", callback_data="admin_holidays")],
         [InlineKeyboardButton(text="🏷 Редагувати назву класу", callback_data="admin_class_info")],
-        [InlineKeyboardButton(text="↩️ Назад до головного меню", callback_data="back_to_main")]
+         [InlineKeyboardButton(text="📖 Детальна інструкція", callback_data="admin_instruction")],
+         [InlineKeyboardButton(text="↩️ Назад до головного меню", callback_data="back_to_main")]
     ])
 
 def homework_management_keyboard():
