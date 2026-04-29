@@ -2,7 +2,7 @@ import html
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from aiogram import Router, F
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery
 from services.schedule import get_week_type, is_school_day, get_timetable_for_date, format_date_uk
 from db.queries.schedule import get_week_config
 from db.queries.duty import get_duty_for_date
@@ -10,18 +10,19 @@ from config import settings
 
 router = Router()
 
-@router.message(F.text == "📅 Розклад сьогодні")
-async def schedule_today(message: Message, db, redis, student):
+@router.callback_query(F.data == "schedule_today")
+async def schedule_today_callback(callback: CallbackQuery, db, redis, student):
     tz = ZoneInfo(settings.TIMEZONE)
     target = datetime.now(tz).date()
-    # показуємо лише один день через існуючу функцію
-    await show_schedule(message, target, db, redis, student)
+    await show_schedule(callback.message, target, db, redis, student)
+    await callback.answer()
 
-@router.message(F.text == "📆 Розклад на 3 дні")
-async def schedule_3_days(message: Message, db, redis, student):
+@router.callback_query(F.data == "schedule_3_days")
+async def schedule_3_days_callback(callback: CallbackQuery, db, redis, student):
     tz = ZoneInfo(settings.TIMEZONE)
     tomorrow = datetime.now(tz).date() + timedelta(days=1)
-    await show_schedule_range(message, tomorrow, 3, db, redis, student)
+    await show_schedule_range(callback.message, tomorrow, 3, db, redis, student)
+    await callback.answer()
 
 # ----------------------------------------------------------------
 # Допоміжна функція для одного дня (використовується з "Сьогодні")

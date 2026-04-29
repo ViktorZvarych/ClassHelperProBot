@@ -52,10 +52,8 @@ async def absent_last_5_days(message: Message, db):
 async def show_instructions(message: Message):
     text = (
         "📖 <b>Головне меню бота</b>\n\n"
-        "• <b>📅 Розклад сьогодні</b> — уроки на поточний день\n"
-        "• <b>📆 Розклад на 3 дні</b> — уроки на завтра + 2 дні\n"
-        "• <b>📖 ДЗ на сьогодні</b> — домашнє завдання на сьогодні\n"
-        "• <b>📚 ДЗ на 3 дні</b> — ДЗ на завтра, післязавтра і післяпіслязавтра\n"
+        "• <b>📅 Розклад</b> — уроки на поточний день і уроки на завтра + 2 дні\n"
+        "• <b>📖 ДЗ</b> — домашнє завдання на сьогодні і ДЗ на завтра, післязавтра і післяпіслязавтра\n"
         "• <b>🧹 Чергування</b> — список чергових, історія, відмітка виконання\n"
         "• <b>👥 Список учнів</b> — список класу, ролі, борги (староста може розсилати повідомлення)\n"
         "• <b>🗳️ Вибори</b> — інформація про актив класу, вотум недовіри, складання повноважень\n"
@@ -64,6 +62,24 @@ async def show_instructions(message: Message):
         "Для початку роботи натисніть /start"
     )
     await message.answer(text, parse_mode="HTML")
+    
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+@router.message(F.text == "📅 Розклад")
+async def schedule_submenu(message: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Розклад сьогодні", callback_data="schedule_today")],
+        [InlineKeyboardButton(text="📆 Розклад на 3 дні", callback_data="schedule_3_days")],
+    ])
+    await message.answer("Оберіть період:", reply_markup=kb)
+
+@router.message(F.text == "📚 Домашнє завдання")
+async def homework_submenu(message: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📖 ДЗ на сьогодні", callback_data="hw_today")],
+        [InlineKeyboardButton(text="📚 ДЗ на 3 дні", callback_data="hw_3_days")],
+    ])
+    await message.answer("Оберіть період:", reply_markup=kb)
 
 @router.message()
 async def unknown_message(message: Message, state: FSMContext, student):

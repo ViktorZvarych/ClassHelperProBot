@@ -105,7 +105,7 @@ async def admin_assign_starosta_manual(callback: CallbackQuery, db):
     await callback.answer()
 
 @router.callback_query(F.data.startswith("admin_assign_starosta_"))
-async def admin_assign_starosta_execute(callback: CallbackQuery, db):
+async def admin_assign_starosta_execute(callback: CallbackQuery, db, bot):
     student_id = int(callback.data.split("_")[3])
     student = await get_student_by_id(db, student_id)
 
@@ -113,9 +113,31 @@ async def admin_assign_starosta_execute(callback: CallbackQuery, db):
         await callback.answer("❌ Учня не знайдено.", show_alert=True)
         return
 
+    # Отримати попереднього старосту для повідомлення
+    old_starosta = await db.fetchrow(
+        "SELECT full_name FROM students WHERE role = 'starosta' AND is_active = true"
+    )
+
     # Скинути попередніх
     await db.execute("UPDATE students SET role = 'student' WHERE role IN ('starosta', 'zamstarosta')")
     await db.execute("UPDATE students SET role = 'starosta', updated_at = now() WHERE id = $1", student_id)
+
+    # Повідомлення в групу
+    if old_starosta:
+        await bot.send_message(
+            settings.GROUP_CHAT_ID,
+            f"👑 <b>Призначено нового старосту!</b>\n\n"
+            f"Було: {html.escape(old_starosta['full_name'])}\n"
+            f"Стало: <b>{html.escape(student['full_name'])}</b>",
+            parse_mode="HTML"
+        )
+    else:
+        await bot.send_message(
+            settings.GROUP_CHAT_ID,
+            f"👑 <b>Призначено старосту!</b>\n\n"
+            f"<b>{html.escape(student['full_name'])}</b> тепер староста класу.",
+            parse_mode="HTML"
+        )
 
     await callback.message.edit_text(
         f"✅ <b>{html.escape(student['full_name'])}</b> призначено старостою!",

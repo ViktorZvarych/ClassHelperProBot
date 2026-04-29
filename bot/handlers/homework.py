@@ -11,21 +11,22 @@ from db.queries.homework import get_homework_for_subjects
 
 router = Router()
 
-# ============ КНОПКИ З ГОЛОВНОГО МЕНЮ ============
-
-@router.message(F.text == "📖 ДЗ на сьогодні")
-async def hw_today_main(message: Message, db, redis, student):
+# Обробники для підменю:
+@router.callback_query(F.data == "hw_today")
+async def hw_today_callback(callback: CallbackQuery, db, redis, student):
     tz = ZoneInfo(settings.TIMEZONE)
     target = datetime.now(tz).date()
-    await show_homework(message, target, db, redis, student, is_first=True)
+    await show_homework(callback.message, target, db, redis, student, is_first=True)
+    await callback.answer()
 
-@router.message(F.text == "📚 ДЗ на 3 дні")
-async def hw_3_days_main(message: Message, db, redis, student):
+@router.callback_query(F.data == "hw_3_days")
+async def hw_3_days_callback(callback: CallbackQuery, db, redis, student):
     tz = ZoneInfo(settings.TIMEZONE)
     tomorrow = datetime.now(tz).date() + timedelta(days=1)
     for offset in range(3):
         target = tomorrow + timedelta(days=offset)
-        await show_homework(message, target, db, redis, student, is_first=(offset == 0))
+        await show_homework(callback.message, target, db, redis, student, is_first=(offset == 0))
+    await callback.answer()
 
 # ============ ОСНОВНА ФУНКЦІЯ ПОКАЗУ ДЗ ============
 

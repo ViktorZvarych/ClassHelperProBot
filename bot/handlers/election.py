@@ -1,4 +1,5 @@
 import html
+import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from aiogram import Router, F
@@ -16,7 +17,7 @@ from bot.keyboards.inline.election import (
 from services.election_service import (
     start_no_confidence, vote_no_confidence, check_no_confidence_result,
     start_regular_election, start_runoff_election, vote_candidate,
-    finalize_election
+    finalize_election, resign_zamstarosta
 )
 from db.queries.election import (
     get_active_election, has_voted, get_non_voters,
@@ -24,6 +25,8 @@ from db.queries.election import (
     get_election_results_by_place
 )
 from db.queries.students import get_all_active_students, get_student_by_id
+
+logger = logging.getLogger(__name__)
 
 router = Router()
 
@@ -35,7 +38,6 @@ async def election_menu(message: Message, student):
         await message.answer("Спочатку зареєструйтесь через /start.")
         return
 
-    # Додати кнопку "Скласти повноваження" для старости/замстарости
     kb = election_menu_keyboard()
     if student['role'] == 'starosta':
         kb.inline_keyboard.insert(1, [
@@ -52,7 +54,6 @@ async def election_menu(message: Message, student):
 
 @router.callback_query(F.data == "election_info")
 async def election_info(callback: CallbackQuery, db):
-    # Отримати поточних старосту та замстаросту
     starosta = await db.fetchrow(
         "SELECT full_name FROM students WHERE role = 'starosta' AND is_active = true"
     )
@@ -100,16 +101,15 @@ async def no_confidence_start(callback: CallbackQuery, state: FSMContext, db, st
     await callback.answer()
 
 @router.callback_query(NoConfidenceVote.waiting_confirm, F.data == "no_confidence_confirm_yes")
-async def no_confidence_confirm_yes(callback: CallbackQuery, state: FSMContext, db, bot, pool):
+async def no_confidence_confirm_yes(callback: CallbackQuery, state: FSMContext, db, bot):
     try:
-        success, result = await start_no_confidence(callback.from_user.id, pool)
+        success, result = await start_no_confidence(callback.from_user.id, db)  # передаємо db як pool
         if not success:
             await callback.message.edit_text(f"❌ {result}")
             await state.clear()
             await callback.answer()
             return
 
-        # Надіслати оголошення в групу
         await bot.send_message(
             settings.GROUP_CHAT_ID,
             "🚫 <b>Розпочато вотум недовіри!</b>\n\n"
@@ -129,7 +129,7 @@ async def no_confidence_confirm_no(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("❌ Ініціацію вотуму скасовано.")
     await callback.answer()
 
-# ========== СКЛАДАННЯ ПОВНОВАЖЕНЬ ==========
+# ========== СКЛАДАННЯ ПОВНОВАЖЕНЬ СТАРОСТИ ==========
 
 @router.callback_query(F.data == "resign_starosta")
 async def resign_starosta_start(callback: CallbackQuery, state: FSMContext):
@@ -143,9 +143,9 @@ async def resign_starosta_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 @router.callback_query(ResignStarosta.waiting_confirm, F.data == "resign_confirm_yes")
-async def resign_starosta_yes(callback: CallbackQuery, state: FSMContext, pool):
+async def resign_starosta_yes(callback: CallbackQuery, state: FSMContext, db):
     try:
-        success, result = await start_regular_election(pool, callback.from_user.id)
+        success, result = await start_regular_election(db, callback.from_user.id)
         if success:
             await callback.message.edit_text("✅ Повноваження складено. Запущено нові вибори!")
         else:
@@ -157,6 +157,73 @@ async def resign_starosta_yes(callback: CallbackQuery, state: FSMContext, pool):
 
 @router.callback_query(ResignStarosta.waiting_confirm, F.data == "resign_confirm_no")
 async def resign_starosta_no(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ Скасовано.")
+    await callback.answer()
+
+# ========== СКЛАДАННЯ ПОВНОВАЖЕНЬ ЗАМСТАРОСТИ ==========
+
+@router.callback_query(F.data == "resign_zamstarosta")
+async def resign_zamstarosta_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "📝 <b>Скласти повноваження замстарости</b>\n\n"
+        "Ви впевнені? Буде призначено наступного кандидата з останніх виборів.",
+        reply_markup=resign_confirm_keyboard(),
+        parse_mode="HTML"
+    )
+    await state.set_state(ResignZamStarosta.waiting_confirm)
+    await callback.answer()
+
+@router.callback_query(ResignZamStarosta.waiting_confirm, F.data == "resign_confirm_yes")
+async def resign_zamstarosta_yes(callback: CallbackQuery, state: FSMContext, db, bot):
+    student_id = callback.from_user.id
+    
+    student = await db.fetchrow(
+        "SELECT id, full_name FROM students WHERE telegram_id = $1 AND is_active = true",
+        student_id
+    )
+    
+    if not student:
+        await callback.answer("❌ Вас не знайдено в системі.", show_alert=True)
+        await state.clear()
+        return
+
+    try:
+        old_zam_name = student['full_name']
+        new_zam_name = await resign_zamstarosta(db, student['id'], db)
+        
+        if new_zam_name:
+            await bot.send_message(
+                settings.GROUP_CHAT_ID,
+                f"📎 <b>Зміна замстарости!</b>\n\n"
+                f"Попередній: {html.escape(old_zam_name)}\n"
+                f"Новий: <b>{html.escape(new_zam_name)}</b>\n"
+                f"(призначено автоматично — 3-є місце на останніх виборах)",
+                parse_mode="HTML"
+            )
+            await callback.message.edit_text(
+                f"✅ Повноваження складено.\n"
+                f"Новий замстарости: <b>{html.escape(new_zam_name)}</b>"
+            )
+        else:
+            await bot.send_message(
+                settings.GROUP_CHAT_ID,
+                f"📎 <b>{html.escape(old_zam_name)}</b> склав повноваження замстарости.\n"
+                f"Посада вакантна (немає даних про попередні вибори).",
+                parse_mode="HTML"
+            )
+            await callback.message.edit_text("✅ Повноваження складено. Посада вакантна.")
+        
+        await state.clear()
+    except Exception as e:
+        logger.error(f"Error in resign_zamstarosta: {e}")
+        await callback.message.edit_text(f"❌ Помилка: {e}")
+        await state.clear()
+    
+    await callback.answer()
+
+@router.callback_query(ResignZamStarosta.waiting_confirm, F.data == "resign_confirm_no")
+async def resign_zamstarosta_no(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("❌ Скасовано.")
     await callback.answer()
