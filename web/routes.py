@@ -90,9 +90,31 @@ async def cron_reset_handler(request):
         await release_cron_lock(redis, "reset_academic_year", today)
     return web.json_response(result)
 
+async def cron_election_reminder_handler(request):
+    token = request.headers.get("X-Cron-Token")
+    if token != settings.CRON_SECRET_TOKEN:
+        return web.Response(status=403)
+    tz = ZoneInfo(settings.TIMEZONE)
+    today = datetime.now(tz).date()
+    redis = request.app["redis"]
+    pool = request.app["db_pool"]
+
+    if not await acquire_cron_lock(redis, "election_reminder", today):
+        return web.json_response({"status": "skipped", "reason": "lock"})
+    if not await mark_cron_run(pool, "election_reminder", today):
+        await release_cron_lock(redis, "election_reminder", today)
+        return web.json_response({"status": "skipped", "reason": "already_run"})
+
+    try:
+        result = await run_election_reminder(request.app)
+    finally:
+        await release_cron_lock(redis, "election_reminder", today)
+    return web.json_response(result)
+
 def setup_routes(app: web.Application):
     app.router.add_get("/ping", ping)
     app.router.add_post("/webhook", webhook_handler)
     app.router.add_get("/cron/evening", cron_evening_handler)
     app.router.add_get("/cron/morning", cron_morning_handler)
     app.router.add_get("/cron/reset_academic_year", cron_reset_handler)
+    app.router.add_get("/cron/election_reminder", cron_election_reminder_handler)

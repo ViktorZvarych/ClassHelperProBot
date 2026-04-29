@@ -1,5 +1,11 @@
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from bot.states.fsm import WriteDeveloper
+from bot.keyboards.main_menu import get_main_menu_keyboard
+from bot.keyboards.inline.common import cancel_button
+from config import settings
+from services.notifications import notify_admins
 
 router = Router()
 
@@ -28,7 +34,33 @@ async def admin_instruction(callback: CallbackQuery):
     await callback.answer()
 
 @router.callback_query(F.data == "write_developer")
-async def write_developer(callback: CallbackQuery, state, redis):
-    # Тут можна переключити в FSM для прийому повідомлення
-    await callback.message.answer("Функціонал у розробці. Повідомлення буде надіслано адміністратору.")
+async def write_developer_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "✉️ <b>Написати розробнику</b>\n\n"
+        "Введіть ваше повідомлення. Воно буде переслано власнику бота.",
+        reply_markup=cancel_button(),
+        parse_mode="HTML"
+    )
+    await state.set_state(WriteDeveloper.waiting_message)
     await callback.answer()
+
+@router.message(WriteDeveloper.waiting_message)
+async def process_developer_message(message: Message, state: FSMContext):
+    text = message.text
+    user = message.from_user
+    
+    # Надіслати повідомлення всім суперадмінам
+    await notify_admins(
+        f"✉️ <b>Повідомлення від користувача</b>\n\n"
+        f"Від: {user.full_name} (@{user.username or 'немає'})\n"
+        f"ID: {user.id}\n\n"
+        f"<b>Текст:</b>\n{text}"
+    )
+    
+    await state.clear()
+    await message.answer(
+        "✅ Ваше повідомлення надіслано розробнику. Дякуємо!",
+        reply_markup=get_main_menu_keyboard(
+            is_super_admin=(user.id in settings.super_admin_ids_set)
+        )
+    )
