@@ -1,5 +1,3 @@
-# Усі FSM StatesGroup
-
 from aiogram.fsm.state import State, StatesGroup
 
 class Broadcast(StatesGroup):
@@ -8,7 +6,6 @@ class Broadcast(StatesGroup):
 
 class AddHomework(StatesGroup):
     waiting_subject = State()
-    waiting_date = State()
     waiting_text = State()
     waiting_is_control = State()
     waiting_confirm = State()
@@ -44,9 +41,23 @@ class ConfirmDuty(StatesGroup):
 
 class GetHomeworkByDate(StatesGroup):
     waiting_date = State()
-    
-class AddHomework(StatesGroup):
-    waiting_subject = State()
-    waiting_text = State()
-    waiting_is_control = State()
-    waiting_confirm = State()
+
+# ========== СТАНИ ДЛЯ ВИБОРІВ ==========
+
+class NoConfidenceVote(StatesGroup):
+    waiting_confirm = State()       # підтвердження ініціації вотуму
+
+class RegularElection(StatesGroup):
+    waiting_vote = State()          # голосування за кандидата
+
+class RunoffElection(StatesGroup):
+    waiting_vote = State()          # голосування у другому турі (нічия)
+
+class ResignStarosta(StatesGroup):
+    waiting_confirm = State()       # підтвердження складання повноважень старости
+
+class ResignZamStarosta(StatesGroup):
+    waiting_confirm = State()       # підтвердження складання повноважень замстарости
+
+class WriteDeveloper(StatesGroup):
+    waiting_message = State()       # написання повідомлення розробнику
