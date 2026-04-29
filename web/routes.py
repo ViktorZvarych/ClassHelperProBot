@@ -4,6 +4,7 @@ from config import settings
 from cron.evening import run_evening_cron
 from cron.morning import run_morning_cron
 from cron.reset_year import run_reset_academic_year
+from cron.election_reminder import run_election_reminder
 from cron.base import acquire_cron_lock, release_cron_lock, mark_cron_run
 from bot.instance import bot
 from aiogram.types import Update
