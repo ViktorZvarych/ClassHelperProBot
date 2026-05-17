@@ -1,3 +1,5 @@
+import calendar
+from datetime import date
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 def confirm_cancel_keyboard():
@@ -42,3 +44,40 @@ def back_to_admin_btn():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="↩️ Назад до адмін-панелі", callback_data="admin_back")]
     ])
+    
+def calendar_keyboard(year: int, month: int, prefix: str = "cal") -> InlineKeyboardMarkup:
+    """Генерує клавіатуру календаря на вказаний місяць."""
+    kb = []
+    # Рядок із назвою місяця та роком + кнопки навігації
+    month_name = [
+        "Січень", "Лютий", "Березень", "Квітень", "Травень", "Червень",
+        "Липень", "Серпень", "Вересень", "Жовтень", "Листопад", "Грудень"
+    ][month - 1]
+    nav_row = [
+        InlineKeyboardButton(text="◀️", callback_data=f"{prefix}_prev_{year}_{month}"),
+        InlineKeyboardButton(text=f"{month_name} {year}", callback_data="ignore"),
+        InlineKeyboardButton(text="▶️", callback_data=f"{prefix}_next_{year}_{month}")
+    ]
+    kb.append(nav_row)
+
+    # Рядок із днями тижня
+    days_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+    kb.append([InlineKeyboardButton(text=dn, callback_data="ignore") for dn in days_names])
+
+    # Дні місяця
+    cal = calendar.monthcalendar(year, month)
+    for week in cal:
+        row = []
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(text=" ", callback_data="ignore"))
+            else:
+                row.append(InlineKeyboardButton(
+                    text=str(day),
+                    callback_data=f"{prefix}_day_{year}_{month}_{day}"
+                ))
+        kb.append(row)
+
+    # Рядок із кнопкою скасування
+    kb.append([InlineKeyboardButton(text="❌ Скасувати", callback_data=f"{prefix}_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
