@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import os
+
 from contextlib import asynccontextmanager
 from aiohttp import web
 from aiogram import Bot, Dispatcher
@@ -8,6 +10,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.redis import RedisStorage, DefaultKeyBuilder
 from aiogram.types import BotCommand
+from datetime import date, datetime
 from redis.asyncio import Redis
 import sentry_sdk
 
@@ -33,6 +36,22 @@ if settings.SENTRY_DSN:
         traces_sample_rate=0.1,
         environment="production",
     )
+    
+def json_serializer(obj):    
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+def json_deserializer(dct):
+        for key, value in dct.items():
+            if isinstance(value, str) and ('date' in key.lower() or 'time' in key.lower()):
+                try:
+                    # Спроба розпарсити як дату/час
+                    dt = datetime.fromisoformat(value)
+                    dct[key] = dt.date() if len(value) == 10 else dt
+                except ValueError:
+                    pass  # не дата — залишаємо як є
+        return dct
 
 async def on_startup(app: web.Application):
     # PostgreSQL
@@ -69,6 +88,8 @@ async def on_startup(app: web.Application):
         key_builder=DefaultKeyBuilder(with_destiny=True),
         state_ttl=300,
         data_ttl=300,
+        json_dumps=lambda data: json.dumps(data, default=json_serializer),
+        json_loads=lambda data: json.loads(data, object_hook=json_deserializer)
     )
 
     # Створюємо Dispatcher зі storage

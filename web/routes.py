@@ -14,6 +14,14 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger(__name__)
 
 async def ping(request):
+    pool = request.app.get("db_pool")
+    if pool:
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("SELECT 1")
+            return web.json_response({"status": "ok", "db": "connected"})
+        except Exception:
+            return web.json_response({"status": "ok", "db": "error"})
     return web.json_response({"status": "ok"})
 
 async def webhook_handler(request):
