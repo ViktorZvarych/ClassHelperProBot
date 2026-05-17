@@ -42,8 +42,8 @@ async def add_holiday_start(callback: CallbackQuery, state: FSMContext):
 # ---- Обробка навігації та вибору для ПОЧАТКОВОЇ дати ----
 @router.callback_query(AddHoliday.waiting_start_date, F.data.startswith("holiday_start_prev_"))
 async def holiday_start_prev(callback: CallbackQuery, state: FSMContext):
-    _, _, y, m = callback.data.split("_")
-    year, month = int(y), int(m)
+    parts = callback.data.split("_")
+    year, month = int(parts[-2]), int(parts[-1])
     if month == 1:
         month = 12
         year -= 1
@@ -55,8 +55,8 @@ async def holiday_start_prev(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(AddHoliday.waiting_start_date, F.data.startswith("holiday_start_next_"))
 async def holiday_start_next(callback: CallbackQuery, state: FSMContext):
-    _, _, y, m = callback.data.split("_")
-    year, month = int(y), int(m)
+    parts = callback.data.split("_")
+    year, month = int(parts[-2]), int(parts[-1])
     if month == 12:
         month = 1
         year += 1
@@ -69,13 +69,12 @@ async def holiday_start_next(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(AddHoliday.waiting_start_date, F.data.startswith("holiday_start_day_"))
 async def holiday_start_day_selected(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
-    year, month, day = int(parts[3]), int(parts[4]), int(parts[5])
+    year, month, day = int(parts[-3]), int(parts[-2]), int(parts[-1])
     start_date = date(year, month, day)
     await state.update_data(start_date=start_date)
 
-    # Переходимо до вибору кінцевої дати
-    today = date.today()
-    await state.update_data(holiday_end_year=year, holiday_end_month=month)  # стартовий місяць як у початкової
+    # Переходимо до вибору кінцевої дати, починаючи з того ж місяця
+    await state.update_data(holiday_end_year=year, holiday_end_month=month)
     await callback.message.edit_text(
         "📅 <b>Оберіть кінцеву дату канікул:</b>",
         reply_markup=calendar_keyboard(year, month, prefix="holiday_end"),
@@ -93,8 +92,8 @@ async def holiday_start_cancel(callback: CallbackQuery, state: FSMContext):
 # ---- Обробка навігації та вибору для КІНЦЕВОЇ дати ----
 @router.callback_query(AddHoliday.waiting_end_date, F.data.startswith("holiday_end_prev_"))
 async def holiday_end_prev(callback: CallbackQuery, state: FSMContext):
-    _, _, y, m = callback.data.split("_")
-    year, month = int(y), int(m)
+    parts = callback.data.split("_")
+    year, month = int(parts[-2]), int(parts[-1])
     if month == 1:
         month = 12
         year -= 1
@@ -106,8 +105,8 @@ async def holiday_end_prev(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(AddHoliday.waiting_end_date, F.data.startswith("holiday_end_next_"))
 async def holiday_end_next(callback: CallbackQuery, state: FSMContext):
-    _, _, y, m = callback.data.split("_")
-    year, month = int(y), int(m)
+    parts = callback.data.split("_")
+    year, month = int(parts[-2]), int(parts[-1])
     if month == 12:
         month = 1
         year += 1
@@ -120,7 +119,7 @@ async def holiday_end_next(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(AddHoliday.waiting_end_date, F.data.startswith("holiday_end_day_"))
 async def holiday_end_day_selected(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
-    year, month, day = int(parts[3]), int(parts[4]), int(parts[5])
+    year, month, day = int(parts[-3]), int(parts[-2]), int(parts[-1])
     end_date = date(year, month, day)
 
     data = await state.get_data()
@@ -219,7 +218,12 @@ async def delete_holiday_list(callback: CallbackQuery, db):
 
 @router.callback_query(F.data.startswith("holiday_del_"))
 async def confirm_delete_holiday(callback: CallbackQuery, db):
-    holiday_id = int(callback.data.split("_")[2])
+    # Перевіряємо, чи це не підтвердження видалення (бо тоді є "confirm")
+    parts = callback.data.split("_")
+    if "confirm" in parts:
+        # це вже обробляє окремий хендлер нижче
+        return
+    holiday_id = int(parts[-1])  # останній елемент — ID
     row = await db.fetchrow("SELECT start_date, end_date, description FROM holidays WHERE id=$1", holiday_id)
     if not row:
         await callback.answer("❌ Запис не знайдено.")
@@ -241,7 +245,8 @@ async def confirm_delete_holiday(callback: CallbackQuery, db):
 
 @router.callback_query(F.data.startswith("holiday_del_confirm_"))
 async def execute_delete_holiday(callback: CallbackQuery, db):
-    holiday_id = int(callback.data.split("_")[3])
+    parts = callback.data.split("_")
+    holiday_id = int(parts[-1])
     await delete_holiday(db, holiday_id)
     await callback.message.edit_text("✅ Канікули видалено!", reply_markup=holidays_management_keyboard())
     await callback.answer()
