@@ -215,6 +215,14 @@ async def delete_holiday_list(callback: CallbackQuery, db):
         parse_mode="HTML"
     )
     await callback.answer()
+    
+@router.callback_query(F.data.startswith("holiday_del_confirm_"))
+async def execute_delete_holiday(callback: CallbackQuery, db):
+    parts = callback.data.split("_")
+    holiday_id = int(parts[-1])
+    await delete_holiday(db, holiday_id)
+    await callback.message.edit_text("✅ Канікули видалено!", reply_markup=holidays_management_keyboard())
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("holiday_del_"))
 async def confirm_delete_holiday(callback: CallbackQuery, db):
@@ -241,12 +249,4 @@ async def confirm_delete_holiday(callback: CallbackQuery, db):
         ]),
         parse_mode="HTML"
     )
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("holiday_del_confirm_"))
-async def execute_delete_holiday(callback: CallbackQuery, db):
-    parts = callback.data.split("_")
-    holiday_id = int(parts[-1])
-    await delete_holiday(db, holiday_id)
-    await callback.message.edit_text("✅ Канікули видалено!", reply_markup=holidays_management_keyboard())
     await callback.answer()
