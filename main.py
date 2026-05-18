@@ -81,6 +81,8 @@ async def on_startup(app: web.Application):
     except Exception as e:
         logger.critical(f"Group chat {settings.GROUP_CHAT_ID} is invalid: {e}")
         raise
+    
+    app["bot"] = bot
 
     # FSM Storage
     storage = RedisStorage.from_url(
